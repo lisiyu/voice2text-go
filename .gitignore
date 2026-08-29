@@ -1,0 +1,36 @@
+# 二进制产物
+voice2text.exe
+voice2text
+*.exe
+*.dll
+*.bin
+*.rai
+
+# 本地运行时文件
+bin/
+voice2text.json
+voice2text.log
+voice2text_panic.log
+
+# 临时文件
+*.tmp
+*.part
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# �����ļ�
+CODE_REVIEW*.md
+NPU_VOICE2TEXT_OPTIONS*.md
+voice2text.exe~
+installer.nsi
+manifest.json
