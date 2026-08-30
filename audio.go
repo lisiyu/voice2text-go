@@ -59,7 +59,7 @@ type Recorder struct {
 	hdrs     []*waveHdr
 	mu       sync.Mutex
 	data     []byte
-	running  bool
+	running  atomic.Bool
 	recStart time.Time // 录音开始时刻（用于时长保护 / 超长提示）
 
 	// 实时能量（RMS）环形缓冲，供悬浮窗绘制波形/声纹
@@ -93,7 +93,7 @@ func (r *Recorder) Start() error {
 		return fmt.Errorf("waveInOpen failed: %d", r1)
 	}
 	r.handle = h
-	r.running = true
+	r.running.Store(true)
 	r.recStart = time.Now()
 	hdrSize := unsafe.Sizeof(waveHdr{})
 	for i := 0; i < 8; i++ {
@@ -113,7 +113,7 @@ func (r *Recorder) Start() error {
 // readLoop 轮询已满的缓冲区，拷出数据并重新投递
 func (r *Recorder) readLoop() {
 	hdrSize := unsafe.Sizeof(waveHdr{})
-	for r.running {
+	for r.running.Load() {
 		for i := range r.hdrs {
 			if r.hdrs[i].dwFlags&WHDR_DONE != 0 {
 				n := int(r.hdrs[i].dwBytesRecorded)
@@ -165,33 +165,28 @@ func (r *Recorder) pushLevel(v float64) {
 
 // Levels 返回最近 ovWaveBars 次 RMS 采样（按时间顺序，旧→新），用于绘制波形。
 // 若尚未录满一圈，前 (ovWaveBars-lvCount) 个为 0。
-// 使用调用方提供的缓冲区避免每帧 GC 分配。
+// 每调用返回独立的局部缓冲（48×4=192B），避免包级共享导致跨调用/跨 goroutine 数据覆盖。
 func (r *Recorder) Levels() []int32 {
+	var buf [ovWaveBars]int32
 	r.lvMu.Lock()
 	defer r.lvMu.Unlock()
 	if r.levels == nil {
-		for i := range levelsBuf {
-			levelsBuf[i] = 0
-		}
-		return levelsBuf[:]
+		return buf[:]
 	}
 	if r.lvCount < ovWaveBars {
-		for i := range levelsBuf {
-			levelsBuf[i] = 0
-		}
-		copy(levelsBuf[ovWaveBars-r.lvCount:], r.levels[:r.lvCount])
-		return levelsBuf[:]
+		copy(buf[ovWaveBars-r.lvCount:], r.levels[:r.lvCount])
+		return buf[:]
 	}
 	// 已满：从最旧开始拷贝
 	for i := 0; i < ovWaveBars; i++ {
-		levelsBuf[i] = r.levels[(r.lvIdx+i)%ovWaveBars]
+		buf[i] = r.levels[(r.lvIdx+i)%ovWaveBars]
 	}
-	return levelsBuf[:]
+	return buf[:]
 }
 
 // Stop 停止并返回 16k/16bit/mono PCM 数据
 func (r *Recorder) Stop() ([]byte, error) {
-	r.running = false
+	r.running.Store(false)
 	waveInStop.Call(r.handle)
 	time.Sleep(50 * time.Millisecond) // 让残余缓冲落盘
 
@@ -277,16 +272,13 @@ func SetActiveRecorder(r *Recorder) {
 }
 
 // CurrentLevels 返回当前录音的实时能量序列（无录音时全 0）
-// 使用预分配缓冲区避免每帧 GC 分配（30fps 下原分配 ~5.7KB/s）。
-var levelsBuf [ovWaveBars]int32
+// 无录音时返回包级零值缓冲（只读，调用方不会修改），避免每帧 192B 分配。
+var zeroLevels [ovWaveBars]int32
 
 func CurrentLevels() []int32 {
 	r := activeRecorder.Load()
 	if r == nil {
-		for i := range levelsBuf {
-			levelsBuf[i] = 0
-		}
-		return levelsBuf[:]
+		return zeroLevels[:]
 	}
 	return r.Levels()
 }

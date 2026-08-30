@@ -61,6 +61,7 @@ const (
 	idKeyF8     = 1011
 	idKeyF9     = 1012
 	idKeyRCtrl  = 1013
+	idKeyLCtrl  = 1018
 	idKeyCaps   = 1014
 	idKeyHome   = 1015
 	idKeyEnd    = 1016
@@ -123,10 +124,10 @@ func utf16Ptr(s string) *uint16 {
 
 func handleMenu(id uintptr) {
 	switch id {
-	case idKeySpace, idKeyF8, idKeyF9, idKeyRCtrl, idKeyCaps, idKeyHome, idKeyEnd, idKeyInsert:
+	case idKeySpace, idKeyF8, idKeyF9, idKeyRCtrl, idKeyLCtrl, idKeyCaps, idKeyHome, idKeyEnd, idKeyInsert:
 		m := map[uintptr]string{
 			idKeySpace: "space", idKeyF8: "f8", idKeyF9: "f9",
-			idKeyRCtrl: "rightctrl", idKeyCaps: "capslock", idKeyHome: "home",
+			idKeyRCtrl: "rightctrl", idKeyLCtrl: "leftctrl", idKeyCaps: "capslock", idKeyHome: "home",
 			idKeyEnd: "end", idKeyInsert: "insert",
 		}
 		if trayCB.onKey != nil {
@@ -161,21 +162,32 @@ func showTrayMenu(hwnd windows.Handle) {
 	procAppendMenu.Call(hMenu, 0, idKeyF8, uintptr(unsafe.Pointer(utf16Ptr("F8"))))
 	procAppendMenu.Call(hMenu, 0, idKeyF9, uintptr(unsafe.Pointer(utf16Ptr("F9"))))
 	procAppendMenu.Call(hMenu, 0, idKeyRCtrl, uintptr(unsafe.Pointer(utf16Ptr("右 Ctrl"))))
+	procAppendMenu.Call(hMenu, 0, idKeyLCtrl, uintptr(unsafe.Pointer(utf16Ptr("左 Ctrl"))))
 	procAppendMenu.Call(hMenu, 0, idKeyCaps, uintptr(unsafe.Pointer(utf16Ptr("CapsLock"))))
 	procAppendMenu.Call(hMenu, 0, idKeyHome, uintptr(unsafe.Pointer(utf16Ptr("Home"))))
 	procAppendMenu.Call(hMenu, 0, idKeyEnd, uintptr(unsafe.Pointer(utf16Ptr("End"))))
 	procAppendMenu.Call(hMenu, 0, idKeyInsert, uintptr(unsafe.Pointer(utf16Ptr("Insert"))))
-	procAppendMenu.Call(hMenu, 0, idCustomKey, uintptr(unsafe.Pointer(utf16Ptr("自定义快捷键..."))))
+	// 如果当前热键不在预设列表中，追加显示
+	cur := currentKeyName()
+	presetKeys := map[string]bool{
+		"space": true, "f8": true, "f9": true, "rightctrl": true, "leftctrl": true,
+		"capslock": true, "home": true, "end": true, "insert": true,
+	}
+	if !presetKeys[cur] && cur != "" {
+		procAppendMenu.Call(hMenu, 0x0800, 0, 0) // separator
+		procAppendMenu.Call(hMenu, 0, idCustomKey, uintptr(unsafe.Pointer(utf16Ptr("当前: "+cur+" (点击修改)"))))
+	} else {
+		procAppendMenu.Call(hMenu, 0, idCustomKey, uintptr(unsafe.Pointer(utf16Ptr("自定义快捷键..."))))
+	}
 	procAppendMenu.Call(hMenu, 0x0800, 0, 0) // separator
 	procAppendMenu.Call(hMenu, 0, idAPI, uintptr(unsafe.Pointer(utf16Ptr("编辑配置 (记事本)..."))))
 	procAppendMenu.Call(hMenu, 0x0800, 0, 0) // separator
 	procAppendMenu.Call(hMenu, 0, idQuit, uintptr(unsafe.Pointer(utf16Ptr("退出"))))
 
 	// 高亮当前热键
-	cur := currentKeyName()
 	highlight := map[string]uintptr{
 		"space": idKeySpace, "f8": idKeyF8, "f9": idKeyF9, "rightctrl": idKeyRCtrl,
-		"capslock": idKeyCaps, "home": idKeyHome, "end": idKeyEnd, "insert": idKeyInsert,
+		"leftctrl": idKeyLCtrl, "capslock": idKeyCaps, "home": idKeyHome, "end": idKeyEnd, "insert": idKeyInsert,
 	}
 	if id, ok := highlight[cur]; ok {
 		procCheckMenuItem.Call(hMenu, id, 0x0008) // MF_BYCOMMAND|MF_CHECKED

@@ -7,7 +7,129 @@ import (
 	"image"
 	"image/color"
 	"image/png"
+	"math"
 )
+
+// ---------- 精致 PNG 图标生成（64x64，带抗锯齿边缘） ----------
+
+// aaPixel 抗锯齿设置像素：根据距离边缘的距离设置 alpha
+func aaPixel(img *image.RGBA, x, y int, c color.RGBA, alpha float64) {
+	if alpha <= 0 {
+		return
+	}
+	if alpha > 1 {
+		alpha = 1
+	}
+	c.A = uint8(float64(c.A) * alpha)
+	img.Set(x, y, c)
+}
+
+// fillCircleAA 抗锯齿填充圆
+func fillCircleAA(img *image.RGBA, cx, cy, r int, c color.RGBA) {
+	S := 64
+	for y := 0; y < S; y++ {
+		for x := 0; x < S; x++ {
+			d := math.Sqrt(float64((x-cx)*(x-cx) + (y-cy)*(y-cy)))
+			if d <= float64(r)-0.5 {
+				img.Set(x, y, c)
+			} else if d <= float64(r)+0.5 {
+				aaPixel(img, x, y, c, float64(r)+0.5-d)
+			}
+		}
+	}
+}
+
+// fillRoundedRectAA 抗锯齿圆角矩形
+func fillRoundedRectAA(img *image.RGBA, x1, y1, x2, y2, r int, c color.RGBA) {
+	S := 64
+	for y := 0; y < S; y++ {
+		for x := 0; x < S; x++ {
+			if x < x1 || x >= x2 || y < y1 || y >= y2 {
+				continue
+			}
+			// 检查圆角
+			cx, cy := 0, 0
+			isCorner := false
+			switch {
+			case x < x1+r && y < y1+r:
+				cx, cy = x1+r, y1+r
+				isCorner = true
+			case x >= x2-r && y < y1+r:
+				cx, cy = x2-r-1, y1+r
+				isCorner = true
+			case x < x1+r && y >= y2-r:
+				cx, cy = x1+r, y2-r-1
+				isCorner = true
+			case x >= x2-r && y >= y2-r:
+				cx, cy = x2-r-1, y2-r-1
+				isCorner = true
+			}
+			if isCorner {
+				d := math.Sqrt(float64((x-cx)*(x-cx) + (y-cy)*(y-cy)))
+				if d <= float64(r)-0.5 {
+					img.Set(x, y, c)
+				} else if d <= float64(r)+0.5 {
+					aaPixel(img, x, y, c, float64(r)+0.5-d)
+				}
+			} else {
+				img.Set(x, y, c)
+			}
+		}
+	}
+}
+
+// fillCircleAA128 128x128 画布的抗锯齿圆
+func fillCircleAA128(img *image.RGBA, cx, cy, r int, c color.RGBA) {
+	S := 128
+	for y := 0; y < S; y++ {
+		for x := 0; x < S; x++ {
+			d := math.Sqrt(float64((x-cx)*(x-cx) + (y-cy)*(y-cy)))
+			if d <= float64(r)-0.5 {
+				img.Set(x, y, c)
+			} else if d <= float64(r)+0.5 {
+				aaPixel(img, x, y, c, float64(r)+0.5-d)
+			}
+		}
+	}
+}
+
+// fillRoundedRectAA128 128x128 画布的抗锯齿圆角矩形
+func fillRoundedRectAA128(img *image.RGBA, x1, y1, x2, y2, r int, c color.RGBA) {
+	S := 128
+	for y := 0; y < S; y++ {
+		for x := 0; x < S; x++ {
+			if x < x1 || x >= x2 || y < y1 || y >= y2 {
+				continue
+			}
+			cx, cy := 0, 0
+			isCorner := false
+			switch {
+			case x < x1+r && y < y1+r:
+				cx, cy = x1+r, y1+r
+				isCorner = true
+			case x >= x2-r && y < y1+r:
+				cx, cy = x2-r-1, y1+r
+				isCorner = true
+			case x < x1+r && y >= y2-r:
+				cx, cy = x1+r, y2-r-1
+				isCorner = true
+			case x >= x2-r && y >= y2-r:
+				cx, cy = x2-r-1, y2-r-1
+				isCorner = true
+			}
+			if isCorner {
+				d := math.Sqrt(float64((x-cx)*(x-cx) + (y-cy)*(y-cy)))
+				if d <= float64(r)-0.5 {
+					img.Set(x, y, c)
+				} else if d <= float64(r)+0.5 {
+					aaPixel(img, x, y, c, float64(r)+0.5-d)
+				}
+			} else {
+				img.Set(x, y, c)
+			}
+		}
+	}
+}
 
 // genPNGIcon 程序化绘制一个麦克风图标（64x64 PNG，透明背景）
 // 设计：白色圆角胶囊（麦克风头）+ 蓝色格栅线 + 蓝色 U 型支架 + 立杆

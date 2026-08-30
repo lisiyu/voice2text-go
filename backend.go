@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 )
@@ -121,12 +122,14 @@ func downloadFile(url, dst string) error {
 		return err
 	}
 	tmp := dst + ".part"
-	resp, err := http.Get(url) //nolint:gosec // 安装器受信任清单内的地址
+	client := &http.Client{Timeout: 10 * time.Minute} // 大模型文件下载允许 10 分钟
+	resp, err := client.Get(url)                      //nolint:gosec // 安装器受信任清单内的地址
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		io.Copy(io.Discard, resp.Body)
 		return fmt.Errorf("下载 %s 失败: HTTP %d", url, resp.StatusCode)
 	}
 	total := resp.ContentLength
@@ -169,9 +172,13 @@ func downloadFile(url, dst string) error {
 // probeWhisperServer 临时拉起 whisper-server 验证该后端在本机是否可用（NPU/GPU 驱动是否就绪）。
 // 成功返回 true（并会关闭临时进程），失败返回 false。
 func probeWhisperServer(exe, model string, port int) bool {
-	// 针对高性能硬件（如您的 128GB RAM 机器），增加线程数以加快模型加载及推理
+	// 动态线程数：CPU核心数，上限16
+	nThreads := runtime.NumCPU()
+	if nThreads > 16 {
+		nThreads = 16
+	}
 	cmd := exec.Command(exe, "--host", "127.0.0.1", "--port", fmt.Sprintf("%d", port),
-		"-m", model, "-l", "zh", "-t", "16") // 从 8 线程提升至 16 线程
+		"-m", model, "-l", "zh", "-t", fmt.Sprintf("%d", nThreads))
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Start(); err != nil {
 		return false
@@ -284,13 +291,15 @@ func loadManifest(manifestURL string) *InstallManifest {
 }
 
 func fetchManifest(url string) (*InstallManifest, error) {
-	resp, err := http.Get(url) //nolint:gosec
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Get(url) //nolint:gosec
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 	var m InstallManifest
 	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		io.Copy(io.Discard, resp.Body)
 		return nil, err
 	}
 	return &m, nil

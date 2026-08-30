@@ -71,21 +71,26 @@ type Config struct {
 const defaultWhisperPort = 8080
 
 var vkMap = map[string]uintptr{
-	"space":     0x20,
-	"f8":        0x77,
-	"f9":        0x78,
-	"rightctrl": 0xA3,
-	"capslock":  0x14,
-	"home":      0x24,
-	"end":       0x23,
-	"insert":    0x2D,
-	"tab":       0x09,
-	"enter":     0x0D,
-	"delete":    0x2E,
-	"left":      0x25,
-	"right":     0x27,
-	"up":        0x26,
-	"down":      0x28,
+	"space":      0x20,
+	"f8":         0x77,
+	"f9":         0x78,
+	"leftshift":  0xA0,
+	"rightshift": 0xA1,
+	"leftctrl":   0xA2,
+	"rightctrl":  0xA3,
+	"leftalt":    0xA4,
+	"rightalt":   0xA5,
+	"capslock":   0x14,
+	"home":       0x24,
+	"end":        0x23,
+	"insert":     0x2D,
+	"tab":        0x09,
+	"enter":      0x0D,
+	"delete":     0x2E,
+	"left":       0x25,
+	"right":      0x27,
+	"up":         0x26,
+	"down":       0x28,
 }
 
 // vkForName 支持预设名 + 任意字母/数字/F1-F24
@@ -146,7 +151,7 @@ func defaultCfg() Config {
 		// 兜底：仅在 NPU 彻底无法使用时，才尝试这个
 		WhisperCLI: filepath.Join(homeDir, ".cache", "lemonade", "bin", "whispercpp", "cpu", "whisper-cli.exe"),
 		API:        "http://localhost:13305/api/v1/audio/transcriptions", Model: "Whisper-Large-v3-Turbo",
-		Language:         "zh",
+		Language:         "",    // 留空=自动检测，支持中英混合；强制中文可填 "zh"
 		Prompt:           "以下是语音转写内容，使用简体中文，英文单词保持原文不要翻译，直接输出。",
 		WarnRecordingSec: 30,
 		MaxRecordingSec:  0,
@@ -163,7 +168,9 @@ func loadCfg() Config {
 	c := defaultCfg()
 	b, err := os.ReadFile(cfgPath())
 	if err == nil {
-		_ = json.Unmarshal(b, &c)
+		if err := json.Unmarshal(b, &c); err != nil {
+			logf("配置文件解析失败: %v", err)
+		}
 	}
 	if _, ok := vkMap[c.Key]; !ok {
 		if vkForName(c.Key) == 0 {
@@ -175,6 +182,22 @@ func loadCfg() Config {
 	}
 	if c.Model == "" {
 		c.Model = defaultCfg().Model
+	}
+	// 边界校验：防止非法配置值导致逻辑异常
+	if c.HoldMs < 50 {
+		c.HoldMs = 50 // 最短 50ms，避免误触
+	}
+	if c.HoldMs > 3000 {
+		c.HoldMs = 3000 // 最长 3s，防止用户以为没反应
+	}
+	if c.WarnRecordingSec <= 0 {
+		c.WarnRecordingSec = 30 // 与 defaultCfg 一致：默认 30s
+	}
+	if c.MaxRecordingSec <= 0 {
+		c.MaxRecordingSec = 300 // 默认 300s
+	}
+	if c.MaxRecordingSec > 3600 {
+		c.MaxRecordingSec = 3600 // 上限 1 小时
 	}
 	return c
 }
@@ -193,10 +216,16 @@ func cfg() *Config { return cfgPtr.Load() }
 var (
 	user32          = syscall.NewLazyDLL("user32.dll")
 	getAsync        = user32.NewProc("GetAsyncKeyState")
-	keybdEvent      = user32.NewProc("keybd_event")
+	sendInput       = user32.NewProc("SendInput")
 	setWinHookEx    = user32.NewProc("SetWindowsHookExW")
 	unhookWinHookEx = user32.NewProc("UnhookWindowsHookEx")
 	callNextHookEx  = user32.NewProc("CallNextHookEx")
+)
+
+// SendInput 常量
+const (
+	inputKeyboard  = 1
+	keyEventFKeyUp = 0x0002
 )
 
 const (
@@ -210,7 +239,7 @@ const (
 // hookKeyDown 由键盘钩子回调同步设置，hotkeyLoop 读取（无竞态）
 var hookKeyDown atomic.Bool
 var recordingActive atomic.Bool // 录音进行中标记，钩子据此决定是否拦截热键
-var hookVK uintptr
+var hookVK atomic.Uintptr
 var hookHandle uintptr
 
 type kbdLLHookStruct struct {
@@ -223,10 +252,25 @@ type kbdLLHookStruct struct {
 
 // lowLevelKeyboardProc 低级键盘钩子：录音期间拦截热键防止字符灌入输入框；
 // 非录音时放行，保持按键原有功能可用。同步设置 hookKeyDown 供 hotkeyLoop 读取。
+// 捕获模式下记录任意按键供 captureKey 消费。
 func lowLevelKeyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
-	if nCode >= 0 && hookVK != 0 && !capturing.Load() {
+	if nCode >= 0 {
 		kb := (*kbdLLHookStruct)(*(*unsafe.Pointer)(unsafe.Pointer(&lParam)))
-		if uintptr(kb.vkCode) == hookVK {
+		vk := uintptr(kb.vkCode)
+
+		// 捕获模式：记录所有按键事件
+		if capturing.Load() {
+			switch wParam {
+			case wmKeyDown, wmSysKeyDown:
+				capturedVK.Store(uint32(vk))
+				capturedKeyDown.Store(true)
+			case wmKeyUp, wmSysKeyUp:
+				capturedKeyDown.Store(false)
+			}
+		}
+
+		// 正常热键拦截（非捕获模式）
+		if hvk := hookVK.Load(); hvk != 0 && !capturing.Load() && vk == hvk {
 			switch wParam {
 			case wmKeyDown, wmSysKeyDown:
 				hookKeyDown.Store(true)
@@ -296,11 +340,35 @@ func modVK(m string) uintptr {
 	return 0
 }
 
+// sendKey 模拟一次按键（SendInput 替代已过时的 keybd_event）
+func sendKey(vk uint16, flags uint32) {
+	type keybdInput struct {
+		wVk         uint16
+		wScan       uint16
+		dwFlags     uint32
+		time        uint32
+		dwExtraInfo uintptr
+	}
+	type input struct {
+		atype uint32
+		ki    keybdInput
+		_     [8]byte // padding 到 32 字节
+	}
+	var inp input
+	inp.atype = inputKeyboard
+	inp.ki.wVk = vk
+	inp.ki.dwFlags = flags
+	sendInput.Call(1, uintptr(unsafe.Pointer(&inp)), unsafe.Sizeof(inp))
+}
+
 func paste() {
-	keybdEvent.Call(0x11, 0, 0, 0) // ctrl down
-	keybdEvent.Call(0x56, 0, 0, 0) // v down
-	keybdEvent.Call(0x56, 0, 2, 0) // v up
-	keybdEvent.Call(0x11, 0, 2, 0) // ctrl up
+	sendKey(0x11, 0) // ctrl down
+	time.Sleep(20 * time.Millisecond)
+	sendKey(0x56, 0) // v down
+	time.Sleep(20 * time.Millisecond)
+	sendKey(0x56, keyEventFKeyUp) // v up
+	time.Sleep(20 * time.Millisecond)
+	sendKey(0x11, keyEventFKeyUp) // ctrl up
 }
 
 // ---------- 状态 ----------
@@ -320,10 +388,16 @@ func (s *Status) set(t string) {
 
 var statusItem *Status // 复用 Status 指针用于 updateStatusItem 兼容
 
+var lastTrayStatus atomic.Value // stores string；防御性的原子读写
+
 func updateStatusItem(s *Status) {
 	s.mu.Lock()
 	t := s.text
 	s.mu.Unlock()
+	if v, _ := lastTrayStatus.Load().(string); v == t {
+		return // 状态未变化，跳过无意义的托盘更新
+	}
+	lastTrayStatus.Store(t)
 	updateTrayStatus("状态：" + t)
 }
 
@@ -383,17 +457,23 @@ func scheduleHideLocked() {
 // 绝不允许在本地服务未就绪时静默回退到远程 13305（Lemonade 半死状态会返回
 // 固定占位串“优优独播剧场”，正是反复踩坑的根因）。
 func transcribe(pcm []byte) (string, error) {
+	return transcribeInternal(pcm, true)
+}
+
+// transcribeInternal 核心转写。precheck=true 时走完整预检/切片逻辑（对外入口），
+// false 用于长音频子段：已在上层做过后端预检，直接转写免去重复健康检查。
+func transcribeInternal(pcm []byte, precheck bool) (string, error) {
 	c := cfg()
 	// 长音频（>30s）按模型窗口切片转写，避免单段超长被 token 上限截断 / 跑满超时。
-	if c.SplitLongAudio && PCMSeconds(pcm) > 30 {
+	if precheck && c.SplitLongAudio && PCMSeconds(pcm) > 30 {
 		return transcribeSplit(pcm, c)
 	}
 	// 选择了本地常驻方案
 	if c.WhisperServerExe != "" {
-		if whisperServerHealthy(c) {
-			return transcribeServer(pcm, c)
+		if precheck && !whisperServerHealthy(c) {
+			return "", fmt.Errorf("本地 NPU 转写服务未就绪（/health 不通，端口 %d），请确认 voice2text 已正常启动", orDefaultInt(c.WhisperServerPort, defaultWhisperPort))
 		}
-		return "", fmt.Errorf("本地 NPU 转写服务未就绪（/health 不通，端口 %d），请确认 voice2text 已正常启动", orDefaultInt(c.WhisperServerPort, defaultWhisperPort))
+		return transcribeServer(pcm, c)
 	}
 	// 仅配置了本地 cli（无常驻 server）时走 cli 直转
 	if c.WhisperCLI != "" {
@@ -414,31 +494,68 @@ func transcribeSplit(pcm []byte, c *Config) (string, error) {
 	if len(chunks) <= 1 {
 		return transcribe(chunks[0])
 	}
+	// 入口预检：server 后端只健康检查一次；若服务未就绪，所有子段都会失败，无需并发轰炸
+	if c.WhisperServerExe != "" && !whisperServerHealthy(c) {
+		return "", fmt.Errorf("本地 NPU 转写服务未就绪（/health 不通，端口 %d）", orDefaultInt(c.WhisperServerPort, defaultWhisperPort))
+	}
 	logf("长音频: 总时长 %.1fs，按 30s 切片为 %d 段转写", PCMSeconds(pcm), len(chunks))
-	var sb strings.Builder
+	type chunkResult struct {
+		text string
+		err  error
+	}
+	results := make([]chunkResult, len(chunks))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 3) // 最多并行 3 路，避免 HTTP 连接池打满
 	for i, ch := range chunks {
-		t, err := transcribe(ch)
-		if err != nil {
-			return "", fmt.Errorf("长音频第 %d/%d 段转写失败: %v", i+1, len(chunks), err)
+		wg.Add(1)
+		go func(idx int, chunk []byte) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			t, err := transcribeInternal(chunk, false) // 跳过重复健康检查/切片
+			if err != nil {
+				logf("长音频第 %d/%d 段转写失败: %v", idx+1, len(chunks), err)
+			}
+			t = strings.TrimSpace(t)
+			results[idx] = chunkResult{text: t, err: err}
+		}(i, ch)
+	}
+	wg.Wait()
+	var sb strings.Builder
+	var firstErr error
+	for i, r := range results {
+		if r.err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("第 %d/%d 段失败: %w", i+1, len(chunks), r.err)
+			}
+			continue
 		}
-		t = strings.TrimSpace(t)
-		if t == "" {
+		if r.text == "" {
 			continue
 		}
 		if sb.Len() > 0 {
 			sb.WriteString("\n")
 		}
-		sb.WriteString(t)
+		sb.WriteString(r.text)
 	}
 	if sb.Len() == 0 {
+		if firstErr != nil {
+			return "", firstErr
+		}
 		return "", fmt.Errorf("长音频切片转写后无有效内容")
+	}
+	if firstErr != nil {
+		return sb.String(), fmt.Errorf("部分段转写失败（已返回成功部分）: %w", firstErr)
 	}
 	return sb.String(), nil
 }
 
 // transcribeCLI 调用本地 whisper-cli.exe（纯本地，最快最稳）
 // ---------- 本地常驻 whisper-server 管理 ----------
-var wsProc *exec.Cmd // 常驻子进程，退出时清理
+var (
+	wsProc *exec.Cmd   // 常驻子进程，退出时清理
+	wsMu   sync.Mutex  // 保护 wsProc 的并发访问（watchConfig goroutine 可能重启，主线程退出时也会清理）
+)
 
 // startWhisperServer 拉起本地 NPU whisper-server 并等待端口就绪（最多 30s）
 func startWhisperServer(c *Config) error {
@@ -461,17 +578,28 @@ func startWhisperServer(c *Config) error {
 	if port == 0 {
 		port = defaultWhisperPort
 	}
+	// 动态线程数：CPU核心数（whisper.cpp 最佳实践），上限16避免过度调度
+	nThreads := runtime.NumCPU()
+	if nThreads > 16 {
+		nThreads = 16
+	}
 	args := []string{
 		"--host", "127.0.0.1", "--port", fmt.Sprintf("%d", port),
-		"-m", c.WhisperModel, "-l", orDefault(c.Language, "zh"),
-		"-t", "16",
+		"-m", c.WhisperModel,
+		"-t", fmt.Sprintf("%d", nThreads),
+	}
+	// language 留空时不传递 -l，让 whisper 自动检测（支持中英混合）
+	if c.Language != "" {
+		args = append(args, "-l", c.Language)
 	}
 	cmd := exec.Command(c.WhisperServerExe, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("启动 whisper-server 失败: %v", err)
+		return fmt.Errorf("启动 whisper-server 失败: %w", err)
 	}
+	wsMu.Lock()
 	wsProc = cmd
+	wsMu.Unlock()
 	logf("whisper-server 已启动 pid=%d (port=%d)，等待 /health 就绪...", cmd.Process.Pid, port)
 
 	// 3) 等待 /health 200（NPU 大模型加载慢，给 90s）。比纯 TCP 端口探测可靠：
@@ -485,25 +613,27 @@ func startWhisperServer(c *Config) error {
 		time.Sleep(500 * time.Millisecond)
 	}
 	// 超时仍不健康：杀掉本次起的进程，避免留新孤儿
+	wsMu.Lock()
 	if wsProc != nil && wsProc.Process != nil {
 		_ = wsProc.Process.Kill()
 		_, _ = wsProc.Process.Wait()
 	}
 	wsProc = nil
+	wsMu.Unlock()
 	return fmt.Errorf("whisper-server 在 90s 内未就绪（/health 不通，NPU 模型加载可能失败）")
 }
 
-// restartWhisperServer 杀掉当前 whisper-server 并在后台启动新实例。
-// 用于每次转写后清理内部状态，防止上下文污染导致空格/幻觉。
-// 新实例在后台就绪，下次请求无需等待模型加载。
+// restartWhisperServer 杀掉当前 whisper-server 并在后台启动新实例（配置热重载后端变更时使用）。
+// 新实例就绪后由 startWhisperServer 内部等待，失败仅记日志不阻断。
 func restartWhisperServer(c *Config) {
+	wsMu.Lock()
 	if wsProc != nil && wsProc.Process != nil {
 		logf("restartWhisperServer: 杀掉当前实例 pid=%d", wsProc.Process.Pid)
 		_ = wsProc.Process.Kill()
 		_, _ = wsProc.Process.Wait()
-		wsProc = nil
 	}
-	// 后台启动新实例并等待就绪（下次请求时已是干净状态）
+	wsProc = nil
+	wsMu.Unlock()
 	if err := startWhisperServer(c); err != nil {
 		logf("restartWhisperServer: 启动失败 %v", err)
 	} else {
@@ -525,6 +655,16 @@ func whisperServerAlive(c *Config) bool {
 	return true
 }
 
+// 全局复用 HTTP Client（连接池复用，避免每次新建）
+var httpClient = &http.Client{Timeout: 60 * time.Second}
+
+var bufPool = sync.Pool{
+	New: func() any { return new(bytes.Buffer) },
+}
+
+var quitCh = make(chan struct{})
+var healthClient = &http.Client{Timeout: 2 * time.Second}
+
 // whisperServerHealthy 调 /health 端点验证 whisper-server 模型已加载、可正常服务。
 // 比 TCP 端口探测可靠：避免“端口先开/模型后载”或僵尸进程占端口时把请求发给半死服务，
 // 拿到空/截断/纯空格结果。该端点不存在(404)时回退 TCP（兼容 lemonade 改版/旧版 server）。
@@ -533,7 +673,7 @@ func whisperServerHealthy(c *Config) bool {
 	if port == 0 {
 		port = defaultWhisperPort
 	}
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := healthClient
 	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/health", port))
 	if err != nil {
 		return false
@@ -553,11 +693,31 @@ func whisperServerHealthy(c *Config) bool {
 // killStaleWhisperServer 清理残留的 whisper-server.exe。
 // 场景：父进程 voice2text 被 taskkill 强杀时，defer 不执行，whisper-server 成孤儿继续占端口，
 // 下次启动若盲目复用会拿到异常结果（空格/乱码/截断）。
+// 优先用 PID 精确杀，无 PID 时退化为按镜像名杀。
 func killStaleWhisperServer() {
+	wsMu.Lock()
+	pid := 0
+	if wsProc != nil && wsProc.Process != nil {
+		pid = wsProc.Process.Pid
+	}
+	wsMu.Unlock()
+	if pid != 0 {
+		// 精确杀：只杀本实例启动的进程
+		cmd := exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid))
+		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+		if err := cmd.Run(); err == nil {
+			logf("已清理残留 whisper-server pid=%d", pid)
+			wsMu.Lock()
+			wsProc = nil
+			wsMu.Unlock()
+			return
+		}
+	}
+	// 退化：PID 不可用（孤儿来自被强杀的旧实例），按镜像名清理
 	cmd := exec.Command("taskkill", "/F", "/IM", "whisper-server.exe")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Run(); err == nil {
-		logf("已清理残留 whisper-server 进程")
+		logf("已清理残留 whisper-server（按镜像名）")
 	}
 }
 
@@ -571,12 +731,16 @@ func orDefault(s, def string) string {
 // transcribeServer 走本地 whisper-server 的 /inference 接口（NPU 常驻，最快）
 func transcribeServer(pcm []byte, c *Config) (string, error) {
 	wav := WAVBytes(pcm)
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	mw := multipart.NewWriter(buf)
 	fw, _ := mw.CreateFormFile("file", "voice.wav")
 	fw.Write(wav)
 	mw.WriteField("model", orDefault(c.Model, "whisper-large-v3-turbo"))
-	mw.WriteField("language", orDefault(c.Language, "zh"))
+	// language 留空时不传递，让 whisper 自动检测（支持中英混合）
+	if c.Language != "" {
+		mw.WriteField("language", c.Language)
+	}
 	if p := strings.TrimSpace(c.Prompt); p != "" {
 		mw.WriteField("prompt", p)
 	}
@@ -585,35 +749,58 @@ func transcribeServer(pcm []byte, c *Config) (string, error) {
 	// 不加此参数 → 第二次起会产生空格/幻觉/假死
 	mw.WriteField("condition_on_previous_text", "false")
 	mw.Close()
+	body := bytes.Clone(buf.Bytes()) // 深拷贝后才能放回 pool
+	bufPool.Put(buf)
 
 	url := c.WhisperServerURL
 	if url == "" {
 		url = fmt.Sprintf("http://127.0.0.1:%d/inference", orDefaultInt(c.WhisperServerPort, defaultWhisperPort))
 	}
-	req, _ := http.NewRequest("POST", url, &buf)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("whisper-server 请求失败: %v", err)
+	client := httpClient
+	const maxRetries = 2
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			logf("whisper-server 请求重试 %d/%d", attempt, maxRetries)
+			time.Sleep(500 * time.Millisecond)
+		}
+		req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
+		req.Header.Set("Content-Type", mw.FormDataContentType())
+		resp, err := client.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("whisper-server 请求失败: %w", err)
+			continue // 网络错误重试
+		}
+		if resp.StatusCode >= 500 {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			lastErr = fmt.Errorf("whisper-server HTTP %d", resp.StatusCode)
+			continue // 5xx 重试
+		}
+		if resp.StatusCode != 200 {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			return "", fmt.Errorf("whisper-server HTTP %d", resp.StatusCode) // 4xx 不重试
+		}
+		var out struct {
+			Text string `json:"text"`
+		}
+		err = json.NewDecoder(resp.Body).Decode(&out)
+		if err != nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+			return "", err
+		}
+		resp.Body.Close()
+		text := strings.TrimSpace(out.Text)
+		// 合并连续空格为单个空格（whisper 模型在静音段产生的幻觉空格）
+		text = reMultiSpace.ReplaceAllString(text, " ")
+		if suspiciousResult(text) {
+			return "", fmt.Errorf("whisper-server 返回异常内容（疑似占位）: %q", text)
+		}
+		return text, nil
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return "", fmt.Errorf("whisper-server HTTP %d", resp.StatusCode)
-	}
-	var out struct {
-		Text string `json:"text"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", err
-	}
-	text := strings.TrimSpace(out.Text)
-	// 合并连续空格为单个空格（whisper 模型在静音段产生的幻觉空格）
-	text = reMultiSpace.ReplaceAllString(text, " ")
-	if suspiciousResult(text) {
-		return "", fmt.Errorf("whisper-server 返回异常内容（疑似占位）: %q", text)
-	}
-	return text, nil
+	return "", lastErr
 }
 
 func orDefaultInt(v, def int) int {
@@ -624,19 +811,20 @@ func orDefaultInt(v, def int) int {
 }
 
 func transcribeCLI(pcm []byte, c *Config) (string, error) {
-	tmp := filepath.Join(os.TempDir(), "v2t_voice.wav")
+	suffix := fmt.Sprintf("_%d", time.Now().UnixNano())
+	tmp := filepath.Join(os.TempDir(), "v2t_voice"+suffix+".wav")
 	if err := os.WriteFile(tmp, WAVBytes(pcm), 0o644); err != nil {
 		return "", err
 	}
 	defer os.Remove(tmp)
-	outBase := filepath.Join(os.TempDir(), "v2t_out")
+	outBase := filepath.Join(os.TempDir(), "v2t_out"+suffix)
 	args := []string{"-m", c.WhisperModel, "-f", tmp, "-nt", "-otxt", "-of", outBase}
 	if c.Language != "" {
 		args = append(args, "-l", c.Language)
 	}
 	cmd := exec.Command(c.WhisperCLI, args...)
 	if b, err := cmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("whisper-cli: %v %s", err, string(b))
+		return "", fmt.Errorf("whisper-cli: %w %s", err, string(b))
 	}
 	txtFile := outBase + ".txt"
 	b, err := os.ReadFile(txtFile)
@@ -649,13 +837,14 @@ func transcribeCLI(pcm []byte, c *Config) (string, error) {
 
 // transcribeAPI 走 OpenAI 兼容转写接口（自定义端点）
 func transcribeAPI(pcm []byte, c *Config) (string, error) {
-	// 连通性预检：避免上游服务挂掉时把垃圾响应当结果粘贴
-	if err := apiReachable(c.API); err != nil {
-		return "", fmt.Errorf("转写服务未运行/不可达（%s）：%v", c.API, err)
+	// 连通性预检：避免上游服务挂掉时把垃圾响应当结果粘贴（缓存 10s 避免重复 TCP 探测）
+	if err := apiReachableCached(c.API, 10*time.Second); err != nil {
+		return "", fmt.Errorf("转写服务未运行/不可达（%s）：%w", c.API, err)
 	}
 	wav := WAVBytes(pcm)
-	var buf bytes.Buffer
-	mw := multipart.NewWriter(&buf)
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	mw := multipart.NewWriter(buf)
 	fw, _ := mw.CreateFormFile("file", "voice.wav")
 	fw.Write(wav)
 	mw.WriteField("model", c.Model)
@@ -663,27 +852,33 @@ func transcribeAPI(pcm []byte, c *Config) (string, error) {
 		mw.WriteField("language", c.Language)
 	}
 	mw.Close()
+	body := bytes.Clone(buf.Bytes())
+	bufPool.Put(buf)
 
-	req, _ := http.NewRequest("POST", c.API, &buf)
+	req, _ := http.NewRequest("POST", c.API, bytes.NewReader(body))
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	if c.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := httpClient
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
 		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	var out struct {
 		Text string `json:"text"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
 		return "", err
 	}
+	resp.Body.Close()
 	text := strings.TrimSpace(out.Text)
 	// 结果合理性校验：上游服务（如 Lemonade）在异常状态下可能回固定占位串，
 	// 直接当结果粘贴会误导用户。命中可疑特征则报错，提示用户检查转写服务。
@@ -696,8 +891,11 @@ func transcribeAPI(pcm []byte, c *Config) (string, error) {
 // apiReachable 用极短超时探 TCP 端口，判断转写服务是否在线
 func apiReachable(apiURL string) error {
 	u, err := url.Parse(apiURL)
-	if err != nil || u.Host == "" {
-		return fmt.Errorf("URL 解析失败: %v", err)
+	if err != nil {
+		return fmt.Errorf("URL 解析失败: %w", err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("URL 解析失败: 空主机名")
 	}
 	host := u.Host
 	if !strings.Contains(host, ":") {
@@ -715,14 +913,34 @@ func apiReachable(apiURL string) error {
 var reChinese = regexp.MustCompile(`[一-龥]`)
 var reMultiSpace = regexp.MustCompile(`\s{2,}`)
 
+var (
+	apiReachableMu     sync.Mutex
+	apiReachableErr    error
+	apiReachableLast   time.Time
+	apiReachableTarget string
+)
+
+func apiReachableCached(apiURL string, ttl time.Duration) error {
+	apiReachableMu.Lock()
+	defer apiReachableMu.Unlock()
+	if apiReachableTarget == apiURL && time.Since(apiReachableLast) < ttl {
+		return apiReachableErr
+	}
+	apiReachableErr = apiReachable(apiURL)
+	apiReachableTarget = apiURL
+	apiReachableLast = time.Now()
+	return apiReachableErr
+}
+
+var suspiciousMarkers = []string{"exclusive", "剧场", "tv", "television", "http://", "https://", "yoyo",
+	"优优独播", "yo yo television", "演示", "demo", "示例", "please subscribe", "点赞 订阅"}
+
 func suspiciousResult(t string) bool {
 	if t == "" {
 		return false
 	}
 	lower := strings.ToLower(t)
-	markers := []string{"exclusive", "剧场", "tv", "television", "http://", "https://", "yoyo",
-		"优优独播", "yo yo television", "演示", "demo", "示例", "please subscribe", "点赞 订阅"}
-	for _, m := range markers {
+	for _, m := range suspiciousMarkers {
 		if strings.Contains(lower, m) {
 			return true
 		}
@@ -759,9 +977,9 @@ func doTranscribe(pcm []byte, status *Status) {
 	}
 	time.Sleep(30 * time.Millisecond)
 	paste()
-	// 转写成功后重启 whisper-server，清理内部状态，防止下次请求空格/幻觉
-	c := cfg()
-	go restartWhisperServer(c)
+	// 不再每次转写后重启 whisper-server：
+	// condition_on_previous_text=false 已防止上下文污染，重启会导致下次请求等待模型重载（10-30s）
+	// 仅在检测到异常结果时才需要重启（由 suspiciousResult 触发错误路径）
 	status.set("已粘贴：" + text)
 }
 
@@ -780,8 +998,15 @@ func logf(format string, a ...interface{}) {
 			return
 		}
 	}
-	fmt.Fprintf(logFile, "[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, a...))
-	logFile.Sync()
+	line := fmt.Sprintf("[%s] %s\n", time.Now().Format("15:04:05"), fmt.Sprintf(format, a...))
+	if _, err := logFile.WriteString(line); err != nil {
+		// 日志文件不可写（磁盘满/句柄失效）：降级 stderr，并关闭句柄，
+		// 让下次 logf 重新 OpenFile 恢复，避免持续对失效句柄重复 syscall
+		fmt.Fprint(os.Stderr, line)
+		logFile.Close()
+		logFile = nil
+	}
+	// 不每次 Sync：OS 会自动刷盘，频繁 Sync 会造成不必要的磁盘 IO
 }
 
 // ---------- 配置热重载 ----------
@@ -798,11 +1023,23 @@ func watchConfig() {
 		}
 		if st.ModTime() != lastMod {
 			lastMod = st.ModTime()
+			prev := cfg()
 			c := loadCfg()
 			cfgPtr.Store(&c)
-			hookVK = vkForName(c.Key) // 配置热重载时同步更新钩子
+			hookVK.Store(vkForName(c.Key)) // 配置热重载时同步更新钩子
 			logf("配置已热重载: key=%s mod=%s api=%s model=%s lang=%s api_key=%s",
 				c.Key, c.Mod, c.API, c.Model, c.Language, boolStr(c.APIKey != ""))
+			// 后端相关配置变更 → 后台重启 whisper-server，让新配置生效
+			if c.WhisperServerExe != "" &&
+				(prev.WhisperServerExe != c.WhisperServerExe ||
+					prev.WhisperModel != c.WhisperModel ||
+					prev.WhisperServerPort != c.WhisperServerPort ||
+					prev.WhisperServerURL != c.WhisperServerURL ||
+					prev.Language != c.Language ||
+					prev.Prompt != c.Prompt) {
+				logf("后端配置已变更，后台重启 whisper-server")
+				go restartWhisperServer(&c)
+			}
 		}
 	}
 }
@@ -834,43 +1071,53 @@ func acquireMutex() bool {
 // ---------- 自定义快捷键捕获 ----------
 var capturing atomic.Bool
 
-// detectAnyKeyDown 扫描主键盘区，返回当前按下的第一个非修饰键（0=无）
-func detectAnyKeyDown() uintptr {
-	for vk := uintptr(0x08); vk <= 0xFE; vk++ {
-		switch vk { // 跳过修饰键/切换键
-		case 0x10, 0x11, 0x12, 0x14, 0x90, 0x91,
-			0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C:
-			continue
-		}
-		if isDown(vk) {
-			return vk
-		}
-	}
-	return 0
-}
+// 捕获模式下钩子回调写入的按键信息
+var capturedVK atomic.Uint32
+var capturedKeyDown atomic.Bool
 
 // captureKey 进入捕获模式：3 秒内按下任意键（松开即生效，Esc 取消）
+// 通过键盘钩子回调直接检测，不依赖 GetAsyncKeyState
 func captureKey() {
 	capturing.Store(true)
+	capturedVK.Store(0)
+	capturedKeyDown.Store(false)
 	updateTrayStatus("状态：请按下新热键（3秒内，Esc取消）")
 	logf("进入自定义快捷键捕获")
+
 	deadline := time.Now().Add(3 * time.Second)
-	prev := uintptr(0)
+	gotKeyDown := false
+	var pressedVK uintptr
+
 	for time.Now().Before(deadline) {
-		vk := detectAnyKeyDown()
-		if vk != 0 && vk != prev {
-			prev = vk
-		}
-		if vk == 0 && prev != 0 { // 已松开
+		if capturedKeyDown.Load() {
+			vk := uintptr(capturedVK.Load())
+			if !gotKeyDown {
+				gotKeyDown = true
+				pressedVK = vk
+				logf("捕获: keydown vk=0x%X", vk)
+			}
+		} else if gotKeyDown {
+			// 松开了
 			capturing.Store(false)
-			if prev == 0x1B { // Esc 取消
+			if pressedVK == 0x1B { // Esc 取消
 				updateTrayStatus("状态：已取消")
 				logf("取消自定义快捷键")
 				return
 			}
-			name := vkToName(prev)
+			// 修饰键无法作为独立热键（释放即停止录音，且与打字冲突），跳过并继续等待下一个键
+			switch pressedVK {
+			case 0x10, 0x11, 0x12, 0x14, 0x90, 0x91,
+				0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C:
+				gotKeyDown = false
+				capturedVK.Store(0)
+				logf("捕获: 修饰键 0x%X 跳过，继续等待", pressedVK)
+				capturing.Store(true) // 恢复捕获模式
+				continue
+			}
+			name := vkToName(pressedVK)
 			if name == "" {
-				updateTrayStatus("状态：不支持的按键")
+				updateTrayStatus("状态：不支持的按键 vk=0x" + fmt.Sprintf("%X", pressedVK))
+				logf("捕获: 不支持的按键 vk=0x%X", pressedVK)
 				return
 			}
 			c := *cfg()
@@ -879,15 +1126,16 @@ func captureKey() {
 			saveCfg(c)
 			nc := c
 			cfgPtr.Store(&nc)
-			hookVK = vkForName(name) // 同步更新钩子拦截的 VK
+			hookVK.Store(vkForName(name)) // 同步更新钩子拦截的 VK
 			updateTrayStatus("状态：快捷键已设为 " + name)
-			logf("自定义快捷键设为 %s", name)
+			logf("自定义快捷键设为 %s (vk=0x%X)", name, pressedVK)
 			return
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(15 * time.Millisecond)
 	}
 	capturing.Store(false)
 	updateTrayStatus("状态：超时未捕获")
+	logf("自定义快捷键超时未捕获")
 }
 
 // ---------- 热键轮询 ----------
@@ -1003,7 +1251,7 @@ func startTray() {
 			saveCfg(c)
 			nc := c
 			cfgPtr.Store(&nc)
-			hookVK = vkForName(k) // 同步更新钩子拦截的 VK
+			hookVK.Store(vkForName(k)) // 同步更新钩子拦截的 VK
 			updateTrayStatus("状态：快捷键已切换为 " + k)
 			logf("热键切换为 %s", k)
 		},
@@ -1016,7 +1264,7 @@ func startTray() {
 		onQuit: func() {
 			logf("收到退出请求")
 			quitTray()
-			os.Exit(0)
+			close(quitCh)
 		},
 	}
 	initTray(cb)
@@ -1032,6 +1280,12 @@ func main() {
 			n := runtime.Stack(buf, false)
 			_ = os.WriteFile(filepath.Join(os.TempDir(), "voice2text_panic.log"),
 				[]byte(fmt.Sprintf("%v\n%s", r, string(buf[:n]))), 0o644)
+		}
+	}()
+	defer func() {
+		if logFile != nil {
+			logFile.Sync()
+			logFile.Close()
 		}
 	}()
 	if len(os.Args) > 1 && os.Args[1] == "--save-icon" {
@@ -1080,7 +1334,7 @@ func main() {
 	}
 	c := loadCfg()
 	cfgPtr.Store(&c)
-	hookVK = vkForName(c.Key) // 钩子始终拦截此 VK
+	hookVK.Store(vkForName(c.Key)) // 钩子始终拦截此 VK
 	logf("启动：热键=%s mod=%s hold=%dms api=%s", c.Key, c.Mod, c.HoldMs, c.API)
 
 	// 自动选后端（安装器写入 auto_backend 时生效）：按 NPU>GPU>CPU 回退。
@@ -1103,6 +1357,8 @@ func main() {
 		} else {
 			// 退出时清理常驻子进程（Kill+Wait 彻底回收，避免留下新孤儿占用端口）
 			defer func() {
+				wsMu.Lock()
+				defer wsMu.Unlock()
 				if wsProc != nil && wsProc.Process != nil {
 					_ = wsProc.Process.Kill()
 					_, _ = wsProc.Process.Wait()
@@ -1122,20 +1378,23 @@ func main() {
 	logf("准备进入自实现托盘循环")
 	startTray()
 	// 主协程阻塞，保持进程存活（托盘消息循环在 goroutine 中运行）
-	select {}
+	<-quitCh
 }
 
-// configHotkeyLoop 全局配置热键：Ctrl+Shift+C 打开配置文件（托盘菜单不可用时的兜底）
+// configHotkeyLoop 全局配置热键：Ctrl+Shift+Alt+C 打开配置文件（托盘菜单不可用时的兜底）。
+// 用较冷门的四键组合，避免与各种应用的单 Ctrl+Shift+C 冲突。
 func configHotkeyLoop() {
 	const vkC = 0x43 // C
 	const vkCtrl = 0x11
 	const vkShift = 0x10
+	const vkAlt = 0x12
 	for {
 		ctrl := isDown(vkCtrl)
 		shift := isDown(vkShift)
+		alt := isDown(vkAlt)
 		c := isDown(vkC)
-		if ctrl && shift && c {
-			logf("配置热键 Ctrl+Shift+C 触发，打开配置")
+		if ctrl && shift && alt && c {
+			logf("配置热键 Ctrl+Shift+Alt+C 触发，打开配置")
 			_ = exec.Command("notepad.exe", cfgPath()).Start()
 			time.Sleep(500 * time.Millisecond) // 防重复触发
 		}
