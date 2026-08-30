@@ -150,7 +150,7 @@ func defaultCfg() Config {
 		WhisperModel: filepath.Join(homeDir, "models", "lemonade", "whispercpp", "ggml-large-v3-turbo.bin"),
 		// 兜底：仅在 NPU 彻底无法使用时，才尝试这个
 		WhisperCLI: filepath.Join(homeDir, ".cache", "lemonade", "bin", "whispercpp", "cpu", "whisper-cli.exe"),
-		API:        "http://localhost:13305/api/v1/audio/transcriptions", Model: "Whisper-Large-v3-Turbo",
+		// 远程 API 预填已移除：本地 NPU 后端已锁定，不再默认配置；需要远程 API 的用户自行填写
 		Language:         "",    // 留空=自动检测，支持中英混合；强制中文可填 "zh"
 		Prompt:           "以下是语音转写内容，使用简体中文，英文单词保持原文不要翻译，直接输出。",
 		WarnRecordingSec: 30,
@@ -177,12 +177,8 @@ func loadCfg() Config {
 			c.Key = "space"
 		}
 	}
-	if c.API == "" {
-		c.API = defaultCfg().API
-	}
-	if c.Model == "" {
-		c.Model = defaultCfg().Model
-	}
+	// 注意：不强制回填 API/Model —— 本地 NPU 后端优先，无需默认远程 API；
+	// 需要远程 API 转写时由用户自行在配置中填写。
 	// 边界校验：防止非法配置值导致逻辑异常
 	if c.HoldMs < 50 {
 		c.HoldMs = 50 // 最短 50ms，避免误触

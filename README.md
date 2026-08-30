@@ -71,7 +71,6 @@ go build -ldflags="-H windowsgui" -o voice2text.exe .
   "key": "space",
   "mod": "",
   "hold_ms": 300,
-  "api": "http://localhost:13305/api/v1/audio/transcriptions",
   "whisper_server_exe": "C:\\path\\to\\whisper-server.exe",
   "whisper_server_url": "http://127.0.0.1:8080/inference",
   "whisper_server_port": 8080,
@@ -84,6 +83,16 @@ go build -ldflags="-H windowsgui" -o voice2text.exe .
   "auto_backend": true
 }
 ```
+
+> **远程 API 模式（可选）**：若不用本地 whisper-server，可将 `whisper_server_exe` 置空并配置以下字段：
+> ```json
+> {
+>   "api": "https://your-endpoint/api/v1/audio/transcriptions",
+>   "model": "Whisper-Large-v3-Turbo",
+>   "api_key": ""
+> }
+> ```
+> `api` 为 OpenAI 兼容转写端点，`model` 传给服务端的模型名，`api_key` 为可选的 Bearer Token（留空则不携带）。默认不预填，仅在需要远程转写时自行填写。
 
 ### 配置项说明
 
@@ -101,6 +110,14 @@ go build -ldflags="-H windowsgui" -o voice2text.exe .
 | `max_recording_sec` | int | `0` | 录音硬上限（0=不限） |
 | `split_long_audio` | bool | `true` | 自动切分长音频 |
 | `auto_backend` | bool | `true` | 自动探测最佳后端 |
+
+**远程 API 模式字段**（默认留空，仅远程转写时需要，不与本地后端同时使用）：
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `api` | string | `""` | OpenAI 兼容转写端点（置空 = 不启用远程模式） |
+| `model` | string | `""` | 传给服务端的模型名（可选，留空由服务端兜底） |
+| `api_key` | string | `""` | 可选 Bearer Token（留空则不携带认证头） |
 
 ## 快捷键
 
