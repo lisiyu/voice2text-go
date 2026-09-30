@@ -3,6 +3,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -31,15 +34,17 @@ func freePort() int {
 // whisperBackend 描述一个 whisper 转写后端候选。
 // 优先级越小越优先：NPU(最快/最省电) > GPU(Vulkan) > CPU(兜底)。
 type whisperBackend struct {
-	Name      string // "npu" / "gpu" / "cpu" / "configured"
-	Label     string // 展示名
-	ExeURL    string // whisper-server.exe 下载地址（留空=仅靠本地已有）
-	ModelURL  string // ggml 模型下载地址（留空=仅靠本地已有）
-	ExeName   string // 落地后的 exe 文件名
-	ModelName string // 落地后的模型文件名
-	Priority  int    // 越小越优先
-	ExePath   string `json:"-"` // 选中后的绝对路径（运行时填充）
-	ModelPath string `json:"-"` // 选中后的绝对路径（运行时填充）
+	Name        string // "npu" / "gpu" / "cpu" / "configured"
+	Label       string // 展示名
+	ExeURL      string // whisper-server.exe 下载地址（留空=仅靠本地已有）
+	ModelURL    string // ggml 模型下载地址（留空=仅靠本地已有）
+	ExeSHA256   string `json:"exe_sha256,omitempty"`   // exe 的 SHA256（hex），下载后校验；留空=跳过校验并记警告
+	ModelSHA256 string `json:"model_sha256,omitempty"` // 模型的 SHA256（hex），下载后校验；留空=跳过校验并记警告
+	ExeName     string // 落地后的 exe 文件名（纯文件名，校验见 safeManifestFileName）
+	ModelName   string // 落地后的模型文件名（纯文件名，校验见 safeManifestFileName）
+	Priority    int    // 越小越优先
+	ExePath     string `json:"-"` // 选中后的绝对路径（运行时填充）
+	ModelPath   string `json:"-"` // 选中后的绝对路径（运行时填充）
 }
 
 // InstallManifest 安装清单：托管在可访问的 URL 或随包内置，描述各后端下载地址。
@@ -114,7 +119,9 @@ func fileExists(p string) bool {
 }
 
 // downloadFile 下载 url 到 dst，带进度输出（仅安装阶段使用）。
-func downloadFile(url, dst string) error {
+// wantSHA256 非空时对下载文件做 SHA256 校验（hex，不区分大小写）；
+// 校验失败删除临时文件并报错。wantSHA256 为空时跳过校验并记警告日志。
+func downloadFile(url, dst, wantSHA256 string) error {
 	if url == "" {
 		return fmt.Errorf("未配置下载地址")
 	}
@@ -122,6 +129,8 @@ func downloadFile(url, dst string) error {
 		return err
 	}
 	tmp := dst + ".part"
+	// 任何失败路径都不留 .part 残留；成功 rename 后 tmp 已不存在，Remove 无害。
+	defer os.Remove(tmp)
 	client := &http.Client{Timeout: 10 * time.Minute} // 大模型文件下载允许 10 分钟
 	resp, err := client.Get(url)                      //nolint:gosec // 安装器受信任清单内的地址
 	if err != nil {
@@ -162,11 +171,37 @@ func downloadFile(url, dst string) error {
 		}
 	}
 	out.Close()
+	if wantSHA256 != "" {
+		sum, err := sha256File(tmp)
+		if err != nil {
+			return fmt.Errorf("计算 SHA256 失败: %w", err)
+		}
+		if !strings.EqualFold(sum, wantSHA256) {
+			return fmt.Errorf("SHA256 校验失败（疑似下载损坏或被篡改）: 期望 %s，实际 %s", wantSHA256, sum)
+		}
+		fmt.Fprintf(os.Stderr, "  SHA256 校验通过 %s\n", filepath.Base(dst))
+	} else {
+		fmt.Fprintf(os.Stderr, "  [警告] %s 未提供 SHA256 校验和，跳过完整性校验\n", filepath.Base(dst))
+	}
 	if err := os.Rename(tmp, dst); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "  下载完成 %s (%.1f MB)\n", filepath.Base(dst), float64(written)/1024/1024)
 	return nil
+}
+
+// sha256File 计算文件的 SHA256 hex。
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 // probeWhisperServer 临时拉起 whisper-server 验证该后端在本机是否可用（NPU/GPU 驱动是否就绪）。
@@ -225,7 +260,7 @@ func selectBackend(m *InstallManifest, dir string) (whisperBackend, error) {
 		if !fileExists(exe) {
 			if b.ExeURL != "" {
 				fmt.Fprintf(os.Stderr, "[探测] 下载 %s 后端 exe...\n", b.Label)
-				if err := downloadFile(b.ExeURL, exe); err != nil {
+				if err := downloadFile(b.ExeURL, exe, b.ExeSHA256); err != nil {
 					fmt.Fprintf(os.Stderr, "[探测] %s exe 获取失败: %v，跳过\n", b.Label, err)
 					continue
 				}
@@ -237,7 +272,7 @@ func selectBackend(m *InstallManifest, dir string) (whisperBackend, error) {
 		if !fileExists(model) {
 			if b.ModelURL != "" {
 				fmt.Fprintf(os.Stderr, "[探测] 下载 %s 模型...\n", b.Label)
-				if err := downloadFile(b.ModelURL, model); err != nil {
+				if err := downloadFile(b.ModelURL, model, b.ModelSHA256); err != nil {
 					fmt.Fprintf(os.Stderr, "[探测] %s 模型获取失败: %v，跳过\n", b.Label, err)
 					continue
 				}
@@ -279,13 +314,50 @@ func pickLocalBackend(m *InstallManifest) (whisperBackend, bool) {
 	return whisperBackend{}, false
 }
 
+// safeManifestFileName 校验清单中的文件名：必须是纯文件名，不允许任何路径成分。
+// ExeName/ModelName 来自远端 manifest（用户可指定 --manifest），未经校验直接
+// filepath.Join(backendDir, name) 会导致路径穿越写出 bin 目录。
+func safeManifestFileName(name string) (string, error) {
+	if name == "" || name == "." || name == ".." {
+		return "", fmt.Errorf("非法文件名: %q", name)
+	}
+	if filepath.Base(name) != name {
+		return "", fmt.Errorf("非法文件名（含路径成分）: %q", name)
+	}
+	if len(name) >= 2 && name[1] == ':' {
+		return "", fmt.Errorf("非法文件名（含盘符）: %q", name)
+	}
+	return name, nil
+}
+
+// validateManifest 校验清单中所有文件名字段，任一非法即拒绝整个清单。
+func validateManifest(m *InstallManifest) error {
+	if m == nil {
+		return fmt.Errorf("空清单")
+	}
+	for i, b := range m.Backends {
+		if _, err := safeManifestFileName(b.ExeName); err != nil {
+			return fmt.Errorf("后端[%d] ExeName %w", i, err)
+		}
+		if _, err := safeManifestFileName(b.ModelName); err != nil {
+			return fmt.Errorf("后端[%d] ModelName %w", i, err)
+		}
+	}
+	return nil
+}
+
 // loadManifest 加载后端清单：优先 --manifest URL，否则用内置默认清单。
 func loadManifest(manifestURL string) *InstallManifest {
 	if manifestURL != "" {
 		if b, err := fetchManifest(manifestURL); err == nil {
-			return b
+			if verr := validateManifest(b); verr == nil {
+				return b
+			} else {
+				fmt.Fprintf(os.Stderr, "[清单] 远程清单文件名校验失败（疑似路径穿越），使用内置默认清单: %v\n", verr)
+			}
+		} else {
+			fmt.Fprintf(os.Stderr, "[清单] 远程清单加载失败，使用内置默认清单\n")
 		}
-		fmt.Fprintf(os.Stderr, "[清单] 远程清单加载失败，使用内置默认清单\n")
 	}
 	return defaultManifest
 }

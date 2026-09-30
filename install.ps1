@@ -11,7 +11,10 @@
 param(
     [string]$InstallDir = "$env:USERPROFILE\voice2text-go",
     [switch]$SkipDownload,
-    [switch]$Force
+    [switch]$Force,
+    # 文件名 -> SHA256(hex)：提供后下载完成即校验，不提供则记警告跳过。
+    # 例：.\install.ps1 -FileHashes @{"whisper-server.exe"="ABC123..."; "ggml-large-v3-turbo.bin"="DEF456..."}
+    [hashtable]$FileHashes = @{}
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,6 +51,28 @@ function Write-Info {
 function Test-Command {
     param([string]$Command)
     $null -ne (Get-Command $Command -ErrorAction SilentlyContinue)
+}
+
+# Test-FileHash: 校验下载文件的 SHA256。$FileHashes 未提供该文件哈希时记警告并跳过。
+function Test-FileHash {
+    param([string]$Path, [string]$FileName, [string]$Desc)
+    $expected = $FileHashes[$FileName]
+    if ([string]::IsNullOrWhiteSpace($expected)) {
+        Write-Warn "$Desc 未提供 SHA256 校验和，跳过完整性校验"
+        return $true
+    }
+    try {
+        $actual = (Get-FileHash -Path $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    } catch {
+        Write-Fail "$Desc 计算 SHA256 失败: $_"
+        return $false
+    }
+    if ($actual -ieq $expected.Trim()) {
+        Write-OK "$Desc SHA256 校验通过"
+        return $true
+    }
+    Write-Fail "$Desc SHA256 校验失败: 期望 $expected, 实际 $actual"
+    return $false
 }
 
 # ============================================================
@@ -205,6 +230,10 @@ if (-not $SkipDownload) {
                 $tmpFile = "$localPath.download"
                 Invoke-WebRequest -Uri $assetUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 300
                 Move-Item -Path $tmpFile -Destination $localPath -Force
+                if (-not (Test-FileHash -Path $localPath -FileName $f.Name -Desc $f.Desc)) {
+                    Remove-Item $localPath -Force -ErrorAction SilentlyContinue
+                    throw "$($f.Desc) SHA256 校验失败，已删除不可信文件"
+                }
                 Write-OK "$($f.Desc) 下载完成 ($(('{0:N2}' -f ((Get-Item $localPath).Length / 1MB))) MB)"
                 $downloadedFiles[$f.Name] = $true
             } catch {
@@ -230,6 +259,10 @@ if (-not $SkipDownload) {
                     $tmpFile = "$localPath.download"
                     Invoke-WebRequest -Uri $assetUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 300
                     Move-Item -Path $tmpFile -Destination $localPath -Force
+                    if (-not (Test-FileHash -Path $localPath -FileName $f.Name -Desc $f.Desc)) {
+                        Remove-Item $localPath -Force -ErrorAction SilentlyContinue
+                        throw "$($f.Desc) SHA256 校验失败，已删除不可信文件"
+                    }
                     Write-OK "$($f.Desc) 下载完成 ($(('{0:N2}' -f ((Get-Item $localPath).Length / 1MB))) MB)"
                     $downloadedFiles[$f.Name] = $true
                 } catch {
@@ -251,6 +284,10 @@ if (-not $SkipDownload) {
                     $tmpFile = "$whisperLocalPath.download"
                     Invoke-WebRequest -Uri $assetUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 300
                     Move-Item -Path $tmpFile -Destination $whisperLocalPath -Force
+                    if (-not (Test-FileHash -Path $whisperLocalPath -FileName "whisper-server-npu.exe" -Desc "Whisper NPU Server")) {
+                        Remove-Item $whisperLocalPath -Force -ErrorAction SilentlyContinue
+                        throw "Whisper NPU Server SHA256 校验失败，已删除不可信文件"
+                    }
                     Write-OK "Whisper NPU Server 下载完成 ($(('{0:N2}' -f ((Get-Item $whisperLocalPath).Length / 1MB))) MB)"
                     $downloadedFiles["whisper-server-npu.exe"] = $true
                 } catch {
@@ -273,6 +310,10 @@ if (-not $SkipDownload) {
                     $tmpFile = "$whisperLocalPath.download"
                     Invoke-WebRequest -Uri $assetUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 300
                     Move-Item -Path $tmpFile -Destination $whisperLocalPath -Force
+                    if (-not (Test-FileHash -Path $whisperLocalPath -FileName "whisper-server.exe" -Desc "Whisper Server")) {
+                        Remove-Item $whisperLocalPath -Force -ErrorAction SilentlyContinue
+                        throw "Whisper Server SHA256 校验失败，已删除不可信文件"
+                    }
                     Write-OK "Whisper Server (通用/CPU) 下载完成 ($(('{0:N2}' -f ((Get-Item $whisperLocalPath).Length / 1MB))) MB)"
                     $downloadedFiles["whisper-server.exe"] = $true
                 } catch {
@@ -357,6 +398,10 @@ if ($ModelBaseUrl -eq "") {
             $tmpFile = "$localPath.download"
             Invoke-WebRequest -Uri $modelUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 600
             Move-Item -Path $tmpFile -Destination $localPath -Force
+            if (-not (Test-FileHash -Path $localPath -FileName $f.Name -Desc $f.Desc)) {
+                Remove-Item $localPath -Force -ErrorAction SilentlyContinue
+                throw "$($f.Desc) SHA256 校验失败，已删除不可信文件"
+            }
             Write-OK "$($f.Desc) ($($f.SizeMB)) 下载完成"
             $downloadedFiles[$f.Name] = $true
         } catch {

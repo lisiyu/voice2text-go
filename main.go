@@ -180,6 +180,9 @@ func loadCfg() Config {
 			c.Key = "space"
 		}
 	}
+	// api_key 落盘时为 DPAPI 加密格式（dpapi:<base64>），这里还原为明文供内存使用；
+	// 历史明文配置原样兼容。
+	c.APIKey = decodeAPIKeyForLoad(c.APIKey)
 	// 注意：不强制回填 API/Model —— 本地 NPU 后端优先，无需默认远程 API；
 	// 需要远程 API 转写时由用户自行在配置中填写。
 	// 边界校验：防止非法配置值导致逻辑异常
@@ -202,6 +205,9 @@ func loadCfg() Config {
 }
 
 func saveCfg(c Config) {
+	// api_key 以 DPAPI 加密后再落盘（encodeAPIKeyForSave 内处理幂等与失败回退）。
+	// c 为值拷贝，不会污染调用方的内存配置。
+	c.APIKey = encodeAPIKeyForSave(c.APIKey)
 	b, _ := json.MarshalIndent(c, "", "  ")
 	_ = os.WriteFile(cfgPath(), b, 0o644)
 }
@@ -712,7 +718,10 @@ func killStaleWhisperServer() {
 			return
 		}
 	}
-	// 退化：PID 不可用（孤儿来自被强杀的旧实例），按镜像名清理
+	// 退化：PID 不可用（孤儿来自被强杀的旧实例），按镜像名清理。
+	// 警告：这会杀掉本机所有 whisper-server.exe（含其他用户会话/其他实例），
+	// 仅在 PID 路径不可用时作为最后兜底。
+	logf("警告: 按镜像名 taskkill whisper-server.exe，可能影响本机其他实例/用户会话的同名进程")
 	cmd := exec.Command("taskkill", "/F", "/IM", "whisper-server.exe")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Run(); err == nil {
@@ -727,29 +736,54 @@ func orDefault(s, def string) string {
 	return s
 }
 
+// buildWavMultipart 构造转写请求的 multipart body。
+// 所有写入错误（CreateFormFile/Write/WriteField/Close）都返回 error，
+// 调用方不得忽略——否则会发出截断/畸形请求，服务端 400 会被误报为"转写失败"。
+func buildWavMultipart(wav []byte, fields [][2]string) (body []byte, contentType string, err error) {
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+	mw := multipart.NewWriter(buf)
+	fw, err := mw.CreateFormFile("file", "voice.wav")
+	if err != nil {
+		return nil, "", fmt.Errorf("构造 multipart 失败: %w", err)
+	}
+	if _, err := fw.Write(wav); err != nil {
+		return nil, "", fmt.Errorf("写入音频数据失败: %w", err)
+	}
+	for _, kv := range fields {
+		if err := mw.WriteField(kv[0], kv[1]); err != nil {
+			return nil, "", fmt.Errorf("写入表单字段 %s 失败: %w", kv[0], err)
+		}
+	}
+	if err := mw.Close(); err != nil {
+		return nil, "", fmt.Errorf("multipart 收尾失败: %w", err)
+	}
+	// 深拷贝后才能把 buf 放回 pool
+	return bytes.Clone(buf.Bytes()), mw.FormDataContentType(), nil
+}
+
 // transcribeServer 走本地 whisper-server 的 /inference 接口（NPU 常驻，最快）
 func transcribeServer(pcm []byte, c *Config) (string, error) {
 	wav := WAVBytes(pcm)
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	mw := multipart.NewWriter(buf)
-	fw, _ := mw.CreateFormFile("file", "voice.wav")
-	fw.Write(wav)
-	mw.WriteField("model", orDefault(c.Model, "whisper-large-v3-turbo"))
+	fields := [][2]string{
+		{"model", orDefault(c.Model, "whisper-large-v3-turbo")},
+		{"response_format", "json"},
+		// 关键：禁用跨请求上下文继承，防止前一次转写结果污染后续请求
+		// 不加此参数 → 第二次起会产生空格/幻觉/假死
+		{"condition_on_previous_text", "false"},
+	}
 	// language 留空时不传递，让 whisper 自动检测（支持中英混合）
 	if c.Language != "" {
-		mw.WriteField("language", c.Language)
+		fields = append(fields, [2]string{"language", c.Language})
 	}
 	if p := strings.TrimSpace(c.Prompt); p != "" {
-		mw.WriteField("prompt", p)
+		fields = append(fields, [2]string{"prompt", p})
 	}
-	mw.WriteField("response_format", "json")
-	// 关键：禁用跨请求上下文继承，防止前一次转写结果污染后续请求
-	// 不加此参数 → 第二次起会产生空格/幻觉/假死
-	mw.WriteField("condition_on_previous_text", "false")
-	mw.Close()
-	body := bytes.Clone(buf.Bytes()) // 深拷贝后才能放回 pool
-	bufPool.Put(buf)
+	body, contentType, err := buildWavMultipart(wav, fields)
+	if err != nil {
+		return "", err
+	}
 
 	url := c.WhisperServerURL
 	if url == "" {
@@ -764,7 +798,7 @@ func transcribeServer(pcm []byte, c *Config) (string, error) {
 			time.Sleep(500 * time.Millisecond)
 		}
 		req, _ := http.NewRequest("POST", url, bytes.NewReader(body))
-		req.Header.Set("Content-Type", mw.FormDataContentType())
+		req.Header.Set("Content-Type", contentType)
 		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = fmt.Errorf("whisper-server 请求失败: %w", err)
@@ -841,21 +875,19 @@ func transcribeAPI(pcm []byte, c *Config) (string, error) {
 		return "", fmt.Errorf("转写服务未运行/不可达（%s）：%w", c.API, err)
 	}
 	wav := WAVBytes(pcm)
-	buf := bufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	mw := multipart.NewWriter(buf)
-	fw, _ := mw.CreateFormFile("file", "voice.wav")
-	fw.Write(wav)
-	mw.WriteField("model", c.Model)
-	if c.Language != "" {
-		mw.WriteField("language", c.Language)
+	fields := [][2]string{
+		{"model", c.Model},
 	}
-	mw.Close()
-	body := bytes.Clone(buf.Bytes())
-	bufPool.Put(buf)
+	if c.Language != "" {
+		fields = append(fields, [2]string{"language", c.Language})
+	}
+	body, contentType, err := buildWavMultipart(wav, fields)
+	if err != nil {
+		return "", err
+	}
 
 	req, _ := http.NewRequest("POST", c.API, bytes.NewReader(body))
-	req.Header.Set("Content-Type", mw.FormDataContentType())
+	req.Header.Set("Content-Type", contentType)
 	if c.APIKey != "" {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	}
@@ -934,6 +966,10 @@ func apiReachableCached(apiURL string, ttl time.Duration) error {
 var suspiciousMarkers = []string{"exclusive", "剧场", "tv", "television", "http://", "https://", "yoyo",
 	"优优独播", "yo yo television", "演示", "demo", "示例", "please subscribe", "点赞 订阅"}
 
+// reASCIIPunct 英文标点白名单：正常英文转写通常携带标点；
+// 仅当长句既无中文标点/中文字符、又无英文标点时，才判为疑似占位。
+var reASCIIPunct = regexp.MustCompile(`[,.!?;:'"()\[\]-]`)
+
 func suspiciousResult(t string) bool {
 	if t == "" {
 		return false
@@ -945,7 +981,7 @@ func suspiciousResult(t string) bool {
 		}
 	}
 	if len([]rune(t)) > 30 && !strings.Contains(t, "，") && !strings.Contains(t, "。") &&
-		!strings.Contains(t, "、") && !reChinese.MatchString(t) {
+		!strings.Contains(t, "、") && !reChinese.MatchString(t) && !reASCIIPunct.MatchString(t) {
 		return true
 	}
 	return false
@@ -962,6 +998,10 @@ func doTranscribe(pcm []byte, status *Status) {
 		status.set("未识别到内容")
 		return
 	}
+	// 串行化"写剪贴板+模拟粘贴"整个序列：并发转写时两个 goroutine 的
+	// WriteAll/paste 若交错，A 的粘贴会贴出 B 的文本。
+	pasteMu.Lock()
+	defer pasteMu.Unlock()
 	var clipErr error
 	for retry := 0; retry < 3; retry++ {
 		clipErr = clipboard.WriteAll(text)
@@ -979,8 +1019,12 @@ func doTranscribe(pcm []byte, status *Status) {
 	// 不再每次转写后重启 whisper-server：
 	// condition_on_previous_text=false 已防止上下文污染，重启会导致下次请求等待模型重载（10-30s）
 	// 仅在检测到异常结果时才需要重启（由 suspiciousResult 触发错误路径）
-	status.set("已粘贴：" + text)
+	// 注意：status 文本会进明文日志文件，这里只记字数，不记语音内容原文。
+	status.set(fmt.Sprintf("已粘贴（%d字）", len([]rune(text))))
 }
+
+// pasteMu 串行化剪贴板写+粘贴序列，见 doTranscribe。
+var pasteMu sync.Mutex
 
 // ---------- 日志（持久化文件句柄，避免每次 OpenFile+Close） ----------
 var logFile *os.File
