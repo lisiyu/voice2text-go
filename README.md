@@ -29,10 +29,13 @@
 
 ```powershell
 # PowerShell 运行
-irm https://raw.githubusercontent.com/lisiyu/voice2text-go/main/install.ps1 | iex
+irm https://cdn.jsdelivr.net/gh/lisiyu/voice2text-go@main/install.ps1 | iex
 ```
 
-或下载 `install.ps1` 后右键"使用 PowerShell 运行"。
+> 国内用户注意：`raw.githubusercontent.com` 在国内经常被重置连接，会导致 `irm`
+> 返回空内容、`iex` 报"无法将参数绑定到参数 Path，因为该参数为空字符串"。
+> 上面命令已改用 jsdelivr 镜像；如果仍失败，可手动下载 `install.ps1` 后右键"使用 PowerShell 运行"。
+> 备用直链：`irm https://raw.githubusercontent.com/lisiyu/voice2text-go/main/install.ps1 | iex`
 
 安装脚本会：
 1. 检测系统硬件（NPU/GPU/CPU）
