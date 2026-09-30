@@ -177,6 +177,32 @@ if (-not (Test-Path $binDir)) {
 }
 Write-OK "目录结构就绪"
 
+# 本地已有文件检测：用户机器上可能已有 lemonade 等工具自带的 whisper 组件
+# （exe / 模型），优先复用，不重复下载。按优先级搜索，$binDir 最优先。
+$localSearchDirs = @(
+    $binDir,
+    "$env:USERPROFILE\.cache\lemonade\bin\whispercpp\npu",
+    "$env:USERPROFILE\.cache\lemonade\bin\whispercpp\cpu",
+    "$env:USERPROFILE\models\lemonade\whispercpp"
+)
+
+# Find-LocalFile 在候选目录中查找已存在且非空的文件，返回完整路径；找不到返回 ""
+function Find-LocalFile {
+    param([string]$FileName)
+    foreach ($d in $localSearchDirs) {
+        if ([string]::IsNullOrWhiteSpace($d)) { continue }
+        $p = Join-Path $d $FileName
+        if ((Test-Path $p) -and ((Get-Item $p).Length -gt 0)) {
+            return $p
+        }
+    }
+    return ""
+}
+
+# $resolvedPaths 记录每个逻辑组件实际解析到的路径（下载到 bin\ 或复用本地已有），
+# 生成配置文件时使用，保证配置指向真实存在的文件。
+$resolvedPaths = @{}
+
 # ============================================================
 # 4. 从 GitHub Releases 下载依赖文件
 # ============================================================
@@ -195,10 +221,6 @@ $npuDeps = @(
     @{ Name = "flexmlrt.dll"; Desc = "FlexML Runtime (NPU)" }
 )
 
-# whisper-server 版本选择：NPU 机器用专用版，其他用通用版
-$whisperServerExeName = if ($hasNPU) { "whisper-server-npu.exe" } else { "whisper-server.exe" }
-$whisperServerDesc = if ($hasNPU) { "Whisper NPU Server (专用)" } else { "Whisper Server (通用/CPU)" }
-
 # 模型文件（第三方下载）
 $modelFiles = @(
     @{ Name = "ggml-large-v3-turbo.bin"; Desc = "Whisper Large-v3-Turbo 模型 (解码器)"; SizeMB = "~1,549" },
@@ -214,14 +236,15 @@ if (-not $SkipDownload) {
         $tag = $release.tag_name
         Write-OK "最新版本: $tag"
 
-        # --- 下载通用 DLL ---
+        # --- 通用 DLL：优先复用本机已有（exe 同目录的 DLL 才能被加载到） ---
         foreach ($f in $commonDeps) {
-            $localPath = Join-Path $binDir $f.Name
-            if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
-                Write-OK "$($f.Desc) 已存在，跳过下载"
+            $foundDll = Find-LocalFile $f.Name
+            if ($foundDll -ne "") {
+                Write-OK "$($f.Desc) 复用本地已有: $foundDll"
                 $downloadedFiles[$f.Name] = $true
                 continue
             }
+            $localPath = Join-Path $binDir $f.Name
 
             $assetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/$($f.Name)"
             Write-Info "下载 $($f.Desc) ..."
@@ -245,12 +268,13 @@ if (-not $SkipDownload) {
         # --- 下载 NPU 专用依赖（仅 NPU 机器）---
         if ($hasNPU) {
             foreach ($f in $npuDeps) {
-                $localPath = Join-Path $binDir $f.Name
-                if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
-                    Write-OK "$($f.Desc) 已存在，跳过下载"
+                $foundDll = Find-LocalFile $f.Name
+                if ($foundDll -ne "") {
+                    Write-OK "$($f.Desc) 复用本地已有: $foundDll"
                     $downloadedFiles[$f.Name] = $true
                     continue
                 }
+                $localPath = Join-Path $binDir $f.Name
 
                 $assetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/$($f.Name)"
                 Write-Info "下载 $($f.Desc) ..."
@@ -271,12 +295,15 @@ if (-not $SkipDownload) {
                 }
             }
 
-            # --- 下载 whisper-server NPU 版 ---
-            $whisperLocalPath = Join-Path $binDir "whisper-server-npu.exe"
-            if (Test-Path $whisperLocalPath -and (Get-Item $whisperLocalPath).Length -gt 0) {
-                Write-OK "Whisper NPU Server 已存在，跳过下载"
+            # --- whisper-server NPU 版：优先复用本机已有（bin\ / lemonade 等），找不到再下载 ---
+            $foundExe = Find-LocalFile "whisper-server-npu.exe"
+            if ($foundExe -eq "") { $foundExe = Find-LocalFile "whisper-server.exe" }
+            if ($foundExe -ne "") {
+                Write-OK "Whisper NPU Server 复用本地已有: $foundExe"
                 $downloadedFiles["whisper-server-npu.exe"] = $true
+                $resolvedPaths["whisper-server"] = $foundExe
             } else {
+                $whisperLocalPath = Join-Path $binDir "whisper-server-npu.exe"
                 $assetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/whisper-server-npu.exe"
                 Write-Info "下载 Whisper NPU Server ..."
 
@@ -290,6 +317,7 @@ if (-not $SkipDownload) {
                     }
                     Write-OK "Whisper NPU Server 下载完成 ($(('{0:N2}' -f ((Get-Item $whisperLocalPath).Length / 1MB))) MB)"
                     $downloadedFiles["whisper-server-npu.exe"] = $true
+                    $resolvedPaths["whisper-server"] = $whisperLocalPath
                 } catch {
                     Write-Fail "Whisper NPU Server 下载失败: $_"
                     if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
@@ -297,12 +325,15 @@ if (-not $SkipDownload) {
             }
 
         } else {
-            # --- 非 NPU 机器：下载通用 whisper-server.exe ---
-            $whisperLocalPath = Join-Path $binDir "whisper-server.exe"
-            if (Test-Path $whisperLocalPath -and (Get-Item $whisperLocalPath).Length -gt 0) {
-                Write-OK "Whisper Server 已存在，跳过下载"
+            # --- 非 NPU 机器：通用 whisper-server.exe，优先复用本机已有 ---
+            $foundExe = Find-LocalFile "whisper-server.exe"
+            if ($foundExe -eq "") { $foundExe = Find-LocalFile "whisper-server-cpu.exe" }
+            if ($foundExe -ne "") {
+                Write-OK "Whisper Server 复用本地已有: $foundExe"
                 $downloadedFiles["whisper-server.exe"] = $true
+                $resolvedPaths["whisper-server"] = $foundExe
             } else {
+                $whisperLocalPath = Join-Path $binDir "whisper-server.exe"
                 $assetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/whisper-server.exe"
                 Write-Info "下载 Whisper Server (通用/CPU) ..."
 
@@ -316,6 +347,7 @@ if (-not $SkipDownload) {
                     }
                     Write-OK "Whisper Server (通用/CPU) 下载完成 ($(('{0:N2}' -f ((Get-Item $whisperLocalPath).Length / 1MB))) MB)"
                     $downloadedFiles["whisper-server.exe"] = $true
+                    $resolvedPaths["whisper-server"] = $whisperLocalPath
                 } catch {
                     Write-Fail "Whisper Server 下载失败: $_"
                     if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
@@ -331,38 +363,42 @@ if (-not $SkipDownload) {
 } else {
     Write-Info "跳过下载，检查本地文件..."
     foreach ($f in $commonDeps) {
-        $localPath = Join-Path $binDir $f.Name
-        if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
-            Write-OK "$($f.Desc) 已存在"
+        $foundDll = Find-LocalFile $f.Name
+        if ($foundDll -ne "") {
+            Write-OK "$($f.Desc) 已存在: $foundDll"
             $downloadedFiles[$f.Name] = $true
         } else {
-            Write-Warn "$($f.Desc) 缺失: $localPath"
+            Write-Warn "$($f.Desc) 缺失（已搜索 bin\ 及常见 lemonade 目录）"
         }
     }
     if ($hasNPU) {
         foreach ($f in $npuDeps) {
-            $localPath = Join-Path $binDir $f.Name
-            if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
-                Write-OK "$($f.Desc) 已存在"
+            $foundDll = Find-LocalFile $f.Name
+            if ($foundDll -ne "") {
+                Write-OK "$($f.Desc) 已存在: $foundDll"
                 $downloadedFiles[$f.Name] = $true
             } else {
-                Write-Warn "$($f.Desc) 缺失: $localPath"
+                Write-Warn "$($f.Desc) 缺失（已搜索 bin\ 及常见 lemonade 目录）"
             }
         }
-        $whisperLocalPath = Join-Path $binDir "whisper-server-npu.exe"
-        if (Test-Path $whisperLocalPath -and (Get-Item $whisperLocalPath).Length -gt 0) {
-            Write-OK "Whisper NPU Server 已存在"
+        $foundExe = Find-LocalFile "whisper-server-npu.exe"
+        if ($foundExe -eq "") { $foundExe = Find-LocalFile "whisper-server.exe" }
+        if ($foundExe -ne "") {
+            Write-OK "Whisper NPU Server 已存在: $foundExe"
             $downloadedFiles["whisper-server-npu.exe"] = $true
+            $resolvedPaths["whisper-server"] = $foundExe
         } else {
-            Write-Warn "Whisper NPU Server 缺失: $whisperLocalPath"
+            Write-Warn "Whisper NPU Server 缺失（已搜索 bin\ 及常见 lemonade 目录）"
         }
     } else {
-        $whisperLocalPath = Join-Path $binDir "whisper-server.exe"
-        if (Test-Path $whisperLocalPath -and (Get-Item $whisperLocalPath).Length -gt 0) {
-            Write-OK "Whisper Server 已存在"
+        $foundExe = Find-LocalFile "whisper-server.exe"
+        if ($foundExe -eq "") { $foundExe = Find-LocalFile "whisper-server-cpu.exe" }
+        if ($foundExe -ne "") {
+            Write-OK "Whisper Server 已存在: $foundExe"
             $downloadedFiles["whisper-server.exe"] = $true
+            $resolvedPaths["whisper-server"] = $foundExe
         } else {
-            Write-Warn "Whisper Server 缺失: $whisperLocalPath"
+            Write-Warn "Whisper Server 缺失（已搜索 bin\ 及常见 lemonade 目录）"
         }
     }
 }
@@ -373,52 +409,53 @@ if (-not $SkipDownload) {
 Write-Step "下载 Whisper 模型..."
 
 if ($ModelBaseUrl -eq "") {
-    Write-Warn "模型下载地址未配置（$ModelBaseUrl），请编辑脚本设置 \$ModelBaseUrl"
-    Write-Info "模型需要手动放置到: $binDir"
-} elseif (-not $SkipDownload) {
-    foreach ($f in $modelFiles) {
-        # NPU 编码器仅 NPU 机器需要
-        if ($f.OnlyNpu -and -not $hasNPU) {
-            Write-Info "跳过 $($f.Desc)（非 NPU 硬件不需要）"
-            continue
-        }
-
-        $localPath = Join-Path $binDir $f.Name
-        if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
-            Write-OK "$($f.Desc) ($($f.SizeMB)) 已存在，跳过下载"
-            $downloadedFiles[$f.Name] = $true
-            continue
-        }
-
-        $modelUrl = "$ModelBaseUrl$($f.Name)"
-        Write-Info "下载 $($f.Desc) ($($f.SizeMB)) ..."
-        Write-Info "  URL: $modelUrl"
-
-        try {
-            $tmpFile = "$localPath.download"
-            Invoke-WebRequest -Uri $modelUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 600
-            Move-Item -Path $tmpFile -Destination $localPath -Force
-            if (-not (Test-FileHash -Path $localPath -FileName $f.Name -Desc $f.Desc)) {
-                Remove-Item $localPath -Force -ErrorAction SilentlyContinue
-                throw "$($f.Desc) SHA256 校验失败，已删除不可信文件"
-            }
-            Write-OK "$($f.Desc) ($($f.SizeMB)) 下载完成"
-            $downloadedFiles[$f.Name] = $true
-        } catch {
-            Write-Fail "$($f.Desc) 下载失败: $_"
-            if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
-        }
+    Write-Info "模型下载地址未配置（`$ModelBaseUrl 为空），将只检测本机已有模型"
+}
+foreach ($f in $modelFiles) {
+    # NPU 编码器仅 NPU 机器需要
+    if ($f.OnlyNpu -and -not $hasNPU) {
+        Write-Info "跳过 $($f.Desc)（非 NPU 硬件不需要）"
+        continue
     }
-} else {
-    foreach ($f in $modelFiles) {
-        if ($f.OnlyNpu -and -not $hasNPU) { continue }
-        $localPath = Join-Path $binDir $f.Name
-        if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
-            Write-OK "$($f.Desc) ($($f.SizeMB)) 已存在"
-            $downloadedFiles[$f.Name] = $true
-        } else {
-            Write-Warn "$($f.Desc) ($($f.SizeMB)) 缺失: $localPath"
+
+    # 本机已有模型优先复用（bin\ / lemonade 等常见位置）
+    $foundModel = Find-LocalFile $f.Name
+    if ($foundModel -ne "") {
+        Write-OK "$($f.Desc) ($($f.SizeMB)) 复用本地已有: $foundModel"
+        $downloadedFiles[$f.Name] = $true
+        $resolvedPaths[$f.Name] = $foundModel
+        continue
+    }
+
+    if ($SkipDownload) {
+        Write-Warn "$($f.Desc) ($($f.SizeMB)) 缺失: $(Join-Path $binDir $f.Name)"
+        continue
+    }
+
+    if ($ModelBaseUrl -eq "") {
+        Write-Warn "$($f.Desc) ($($f.SizeMB)) 未找到本地文件，请手动放置到: $(Join-Path $binDir $f.Name)"
+        continue
+    }
+
+    $localPath = Join-Path $binDir $f.Name
+    $modelUrl = "$ModelBaseUrl$($f.Name)"
+    Write-Info "下载 $($f.Desc) ($($f.SizeMB)) ..."
+    Write-Info "  URL: $modelUrl"
+
+    try {
+        $tmpFile = "$localPath.download"
+        Invoke-WebRequest -Uri $modelUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 600
+        Move-Item -Path $tmpFile -Destination $localPath -Force
+        if (-not (Test-FileHash -Path $localPath -FileName $f.Name -Desc $f.Desc)) {
+            Remove-Item $localPath -Force -ErrorAction SilentlyContinue
+            throw "$($f.Desc) SHA256 校验失败，已删除不可信文件"
         }
+        Write-OK "$($f.Desc) ($($f.SizeMB)) 下载完成"
+        $downloadedFiles[$f.Name] = $true
+        $resolvedPaths[$f.Name] = $localPath
+    } catch {
+        Write-Fail "$($f.Desc) 下载失败: $_"
+        if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
     }
 }
 
@@ -429,21 +466,20 @@ Write-Step "生成配置文件..."
 
 $configPath = "$InstallDir\voice2text.json"
 
-# 根据下载情况选择 whisper-server exe 和模型路径
-$selectedExeName = ""
-if ($downloadedFiles.ContainsKey("whisper-server-npu.exe")) {
-    $selectedExeName = "whisper-server-npu.exe"
-} elseif ($downloadedFiles.ContainsKey("whisper-server.exe")) {
-    $selectedExeName = "whisper-server.exe"
-}
-
+# 根据实际解析到的文件位置（下载到 bin\ 或复用本机已有）生成配置
+# 使用实际解析到的路径（下载到 bin\ 或复用本机已有），而不是硬拼 bin\
 $whisperServerExe = ""
-$whisperModel = ""
-if ($selectedExeName) {
-    $whisperServerExe = (Join-Path $binDir $selectedExeName).Replace('\', '\\')
+if ($resolvedPaths.ContainsKey("whisper-server")) {
+    $whisperServerExe = $resolvedPaths["whisper-server"].Replace('\', '\\')
 }
-if ($downloadedFiles.ContainsKey("ggml-large-v3-turbo.bin")) {
-    $whisperModel = (Join-Path $binDir "ggml-large-v3-turbo.bin").Replace('\', '\\')
+$whisperModel = ""
+if ($resolvedPaths.ContainsKey("ggml-large-v3-turbo.bin")) {
+    $whisperModel = $resolvedPaths["ggml-large-v3-turbo.bin"].Replace('\', '\\')
+}
+# whisper-cli 作为 CPU 兜底：检测本机已有（lemonade 等），找不到则留空
+$whisperCli = Find-LocalFile "whisper-cli.exe"
+if ($whisperCli -ne "") {
+    Write-OK "Whisper CLI 复用本地已有: $whisperCli"
 }
 
 $config = @{
@@ -460,7 +496,11 @@ $config = @{
     max_recording_sec = 0
     split_long_audio = $true
     auto_backend = $true
-} | ConvertTo-Json -Depth 10
+}
+if ($whisperCli -ne "") {
+    $config["whisper_cli"] = $whisperCli
+}
+$config | ConvertTo-Json -Depth 10
 
 if ((Test-Path $configPath) -and -not $Force) {
     Write-Warn "配置文件已存在: $configPath"
@@ -492,11 +532,12 @@ if ($exeFullPath) {
 # ============================================================
 # 8. 编译（如果从源码安装）
 # ============================================================
-$sourceDir = Split-Path -Parent $PSScriptRoot
-$sourceGoFile = Join-Path $sourceDir "main.go"
-$compiledExe = Join-Path $sourceDir "voice2text.exe"
+# 注意：通过 irm ... | iex 管道执行时 $PSScriptRoot 为空，此时跳过源码编译
+$sourceDir = if ($PSScriptRoot) { Split-Path -Parent $PSScriptRoot } else { "" }
+$sourceGoFile = if ($sourceDir -ne "") { Join-Path $sourceDir "main.go" } else { "" }
+$compiledExe = if ($sourceDir -ne "") { Join-Path $sourceDir "voice2text.exe" } else { "" }
 
-if ((Test-Path $sourceGoFile) -and $hasGo) {
+if (($sourceGoFile -ne "") -and (Test-Path $sourceGoFile) -and $hasGo) {
     Write-Step "从源码编译..."
     Write-Info "检测到源码目录，正在编译..."
 
