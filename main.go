@@ -137,25 +137,35 @@ func vkToName(vk uintptr) string {
 }
 
 func defaultCfg() Config {
-	homeDir, _ := os.UserHomeDir()
-	// 强制锁定 NPU 路径，不再为寻找 CPU/GPU 做无效探测
-	npuBinDir := filepath.Join(homeDir, ".cache", "lemonade", "bin", "whispercpp", "npu")
+	// 模型与语音服务默认与软件安装在同一目录（<exe 所在目录>\bin\），
+	// 与 install.ps1 的落地布局、backendDir("") 的解析保持一致。
+	// 不再硬编码 lemonade 缓存路径：旧默认指向用户机器上可能根本不存在的
+	// 路径，会导致录音正常、最后一步转写报"服务未就绪"失败。
+	binDir := backendDir("")
+	// NPU>GPU>CPU>通用：已存在哪个用哪个；都不存在时给通用名（安装器按机器类型下载对应 exe）。
+	serverExe := filepath.Join(binDir, "whisper-server.exe")
+	for _, name := range []string{"whisper-server-npu.exe", "whisper-server-vulkan.exe", "whisper-server-cpu.exe"} {
+		if fileExists(filepath.Join(binDir, name)) {
+			serverExe = filepath.Join(binDir, name)
+			break
+		}
+	}
 
 	return Config{Key: "space", Mod: "", HoldMs: 300,
-		// 锁定 NPU 后端路径
-		WhisperServerExe:  filepath.Join(npuBinDir, "whisper-server.exe"),
+		WhisperServerExe:  serverExe,
 		WhisperServerURL:  "http://127.0.0.1:8080/inference",
 		WhisperServerPort: 8080,
-		// 模型加载路径也同步锁定到 NPU 推荐路径
-		WhisperModel: filepath.Join(homeDir, "models", "lemonade", "whispercpp", "ggml-large-v3-turbo.bin"),
-		// 兜底：仅在 NPU 彻底无法使用时，才尝试这个
-		WhisperCLI: filepath.Join(homeDir, ".cache", "lemonade", "bin", "whispercpp", "cpu", "whisper-cli.exe"),
-		// 远程 API 预填已移除：本地 NPU 后端已锁定，不再默认配置；需要远程 API 的用户自行填写
-		Language:         "",    // 留空=自动检测，支持中英混合；强制中文可填 "zh"
+		// 模型与语音服务同目录：安装器下载到 bin\ 的 ggml-large-v3-turbo.bin
+		WhisperModel: filepath.Join(binDir, "ggml-large-v3-turbo.bin"),
+		// cli 兜底同样走同目录
+		WhisperCLI: filepath.Join(binDir, "whisper-cli.exe"),
+		// 远程 API 预填已移除：本地后端优先，无需默认远程 API；需要远程 API 的用户自行填写
+		Language:         "", // 留空=自动检测，支持中英混合；强制中文可填 "zh"
 		Prompt:           "以下是语音转写内容，使用简体中文，英文单词保持原文不要翻译，直接输出。",
 		WarnRecordingSec: 30,
 		MaxRecordingSec:  0,
 		SplitLongAudio:   true,
+		AutoBackend:      true, // 启动时自动探测并复用本机已存在的后端（与安装器写入一致）
 	}
 }
 
@@ -558,8 +568,8 @@ func transcribeSplit(pcm []byte, c *Config) (string, error) {
 // transcribeCLI 调用本地 whisper-cli.exe（纯本地，最快最稳）
 // ---------- 本地常驻 whisper-server 管理 ----------
 var (
-	wsProc *exec.Cmd   // 常驻子进程，退出时清理
-	wsMu   sync.Mutex  // 保护 wsProc 的并发访问（watchConfig goroutine 可能重启，主线程退出时也会清理）
+	wsProc *exec.Cmd  // 常驻子进程，退出时清理
+	wsMu   sync.Mutex // 保护 wsProc 的并发访问（watchConfig goroutine 可能重启，主线程退出时也会清理）
 )
 
 // startWhisperServer 拉起本地 NPU whisper-server 并等待端口就绪（最多 30s）
