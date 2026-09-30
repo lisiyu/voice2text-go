@@ -3,14 +3,13 @@
 .SYNOPSIS
     voice2text-go 一键安装脚本
 .DESCRIPTION
-    自动检测系统硬件（NPU/GPU/CPU），下载所需依赖，安装并配置语音转文字工具。
+    自动检测系统硬件（NPU/GPU/CPU），从 GitHub Releases 下载依赖，模型文件从第三方下载，安装并配置语音转文字工具。
 .NOTES
     以管理员权限运行：右键 install.ps1 -> 使用 PowerShell 运行
 #>
 
 param(
     [string]$InstallDir = "$env:LOCALAPPDATA\voice2text-go",
-    [string]$ModelDir = "$env:LOCALAPPDATA\voice2text-go\models",
     [switch]$SkipDownload,
     [switch]$Force
 )
@@ -51,42 +50,26 @@ function Test-Command {
     $null -ne (Get-Command $Command -ErrorAction SilentlyContinue)
 }
 
-function Get-FileHashSHA256 {
-    param([string]$Path)
-    (Get-FileHash -Path $Path -Algorithm SHA256).Hash
-}
+# ============================================================
+# GitHub Releases 配置（所有依赖文件从这里下载）
+# ============================================================
+$RepoOwner = "lisiyu"
+$RepoName = "voice2text-go"
+$LatestReleaseUrl = "https://api.github.com/repos/$RepoOwner/$RepoName/releases/latest"
 
-function Download-File {
-    param(
-        [string]$Url,
-        [string]$OutFile,
-        [string]$Description
-    )
-    if (Test-Path $OutFile) {
-        Write-Info "$Description 已存在，跳过下载"
-        return $true
-    }
-    Write-Info "下载 $Description ..."
-    Write-Info "  URL: $Url"
-    try {
-        $tmpFile = "$OutFile.download"
-        Invoke-WebRequest -Uri $Url -OutFile $tmpFile -UseBasicParsing
-        Move-Item -Path $tmpFile -Destination $OutFile -Force
-        Write-OK "$Description 下载完成"
-        return $true
-    } catch {
-        Write-Fail "$Description 下载失败: $_"
-        if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force }
-        return $false
-    }
-}
+# ============================================================
+# 模型文件下载地址（第三方托管，大文件不适合放 GitHub）
+# ============================================================
+$ModelBaseUrl = "" # TODO: 替换为实际下载地址前缀，例如 https://your-cdn.example/models/
+# 完整 URL：
+#   $ModelBaseUrl + "ggml-large-v3-turbo.bin"              (~1.5GB)
+#   $ModelBaseUrl + "ggml-large-v3-turbo-encoder-vitisai.rai" (~708MB)
 
 # ============================================================
 # 1. 硬件检测
 # ============================================================
 Write-Step "检测系统硬件..."
 
-# CPU 信息
 $cpu = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
 $cpuName = $cpu.Name
 $cpuCores = $cpu.NumberOfCores
@@ -142,7 +125,6 @@ if ($ramGB -lt 8) {
 # ============================================================
 Write-Step "检测系统依赖..."
 
-# Go
 $hasGo = Test-Command "go"
 if ($hasGo) {
     $goVersion = (go version 2>$null) -replace ".*go(\d+\.\d+\.\d+).*", '$1'
@@ -151,7 +133,6 @@ if ($hasGo) {
     Write-Warn "Go 未安装，将使用预编译二进制"
 }
 
-# Git
 $hasGit = Test-Command "git"
 if ($hasGit) {
     Write-OK "Git"
@@ -160,131 +141,274 @@ if ($hasGit) {
 }
 
 # ============================================================
-# 3. 创建目录结构
+# 3. 创建目录结构（仅 bin/）
 # ============================================================
 Write-Step "创建安装目录..."
 
-$dirs = @($InstallDir, "$InstallDir\bin", $ModelDir)
-foreach ($dir in $dirs) {
-    if (-not (Test-Path $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        Write-Info "创建: $dir"
-    }
+$binDir = "$InstallDir\bin"
+if (-not (Test-Path $binDir)) {
+    New-Item -ItemType Directory -Path $binDir -Force | Out-Null
+    Write-Info "创建: $binDir"
 }
 Write-OK "目录结构就绪"
 
 # ============================================================
-# 4. 下载 whisper-server 和模型
+# 4. 从 GitHub Releases 下载依赖文件
 # ============================================================
 Write-Step "下载 Whisper 组件..."
 
-$binDir = "$InstallDir\bin"
-
-# whisper-server 后端候选
-$backends = @(
-    @{
-        Name = "NPU (AMD Ryzen AI XDNA)"
-        ExeUrl = "https://github.com/ggerganov/whisper.cpp/releases/download/v1.7.5/whisper-bin-x64.zip"
-        FileName = "whisper-server.exe"
-        Priority = if ($hasNPU) { 0 } else { 99 }
-    },
-    @{
-        Name = "CPU (通用)"
-        ExeUrl = "https://github.com/ggerganov/whisper.cpp/releases/download/v1.7.5/whisper-bin-x64.zip"
-        FileName = "whisper-server.exe"
-        Priority = if ($hasNPU) { 1 } else { 0 }
-    }
+# 通用 DLL（所有硬件都需要，总计 ~8MB）
+$commonDeps = @(
+    @{ Name = "ggml.dll"; Desc = "GGML Core DLL" },
+    @{ Name = "ggml-base.dll"; Desc = "GGML Base DLL" },
+    @{ Name = "ggml-cpu.dll"; Desc = "GGML CPU DLL" },
+    @{ Name = "whisper.dll"; Desc = "Whisper DLL" }
 )
 
-# 按优先级排序
-$backends = $backends | Sort-Object { $_.Priority }
+# NPU 专用依赖（仅 NPU 机器下载）
+$npuDeps = @(
+    @{ Name = "flexmlrt.dll"; Desc = "FlexML Runtime (NPU)" }
+)
 
-# 模型
-$modelUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
-$modelFile = "$ModelDir\ggml-large-v3-turbo.bin"
-$modelSizeMB = 1549
+# whisper-server 版本选择：NPU 机器用专用版，其他用通用版
+$whisperServerExeName = if ($hasNPU) { "whisper-server-npu.exe" } else { "whisper-server.exe" }
+$whisperServerDesc = if ($hasNPU) { "Whisper NPU Server (专用)" } else { "Whisper Server (通用/CPU)" }
 
-# 下载 whisper-server
-$exePath = "$binDir\whisper-server.exe"
-if (Test-Path $exePath) {
-    Write-OK "whisper-server.exe 已存在"
-} elseif (-not $SkipDownload) {
-    Write-Info "下载 whisper-server..."
-    $downloaded = $false
-    foreach ($backend in $backends) {
-        Write-Info "尝试 $($backend.Name) 后端..."
-        $zipUrl = $backend.ExeUrl
-        $zipFile = "$binDir\whisper-server.zip"
-        
-        if (Download-File -Url $zipUrl -OutFile $zipFile -Description "whisper-server ($($backend.Name))") {
+# 模型文件（第三方下载）
+$modelFiles = @(
+    @{ Name = "ggml-large-v3-turbo.bin"; Desc = "Whisper Large-v3-Turbo 模型 (解码器)"; SizeMB = "~1,549" },
+    @{ Name = "ggml-large-v3-turbo-encoder-vitisai.rai"; Desc = "Vitis AI NPU 编码器"; SizeMB = "~708"; OnlyNpu = $true }
+)
+
+$downloadedFiles = @{}
+
+if (-not $SkipDownload) {
+    try {
+        Write-Info "获取 GitHub Releases 最新标签..."
+        $release = Invoke-RestMethod -Uri $LatestReleaseUrl -Headers @{ "User-Agent"="voice2text-installer" }
+        $tag = $release.tag_name
+        Write-OK "最新版本: $tag"
+
+        # --- 下载通用 DLL ---
+        foreach ($f in $commonDeps) {
+            $localPath = Join-Path $binDir $f.Name
+            if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
+                Write-OK "$($f.Desc) 已存在，跳过下载"
+                $downloadedFiles[$f.Name] = $true
+                continue
+            }
+
+            $assetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/$($f.Name)"
+            Write-Info "下载 $($f.Desc) ..."
+
             try {
-                Expand-Archive -Path $zipFile -DestinationPath $binDir -Force
-                Remove-Item $zipFile -Force
-                
-                # 检查解压后的文件名
-                $candidates = @("whisper-server.exe", "main.exe", "whisper.exe")
-                foreach ($c in $candidates) {
-                    $src = "$binDir\$c"
-                    if (Test-Path $src) {
-                        if ($c -ne "whisper-server.exe") {
-                            Rename-Item -Path $src -NewName "whisper-server.exe" -Force
-                        }
-                        $downloaded = $true
-                        break
-                    }
-                }
-                
-                # 清理解压出的多余文件
-                Get-ChildItem $binDir -Filter "*.exe" | Where-Object { $_.Name -ne "whisper-server.exe" } | Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem $binDir -Filter "*.txt" | Remove-Item -Force -ErrorAction SilentlyContinue
-                Get-ChildItem $binDir -Filter "*.md" | Remove-Item -Force -ErrorAction SilentlyContinue
-                
-                break
+                $tmpFile = "$localPath.download"
+                Invoke-WebRequest -Uri $assetUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 300
+                Move-Item -Path $tmpFile -Destination $localPath -Force
+                Write-OK "$($f.Desc) 下载完成 ($(('{0:N2}' -f ((Get-Item $localPath).Length / 1MB))) MB)"
+                $downloadedFiles[$f.Name] = $true
             } catch {
-                Write-Warn "解压失败: $_"
+                Write-Fail "$($f.Desc) 下载失败: $_"
+                if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
             }
         }
-    }
-    
-    if (-not $downloaded) {
-        Write-Fail "无法下载 whisper-server"
-        Write-Info "请手动下载 whisper-server 并放置到: $binDir"
-    }
-}
 
-# 下载模型
-if (Test-Path $modelFile) {
-    Write-OK "模型文件已存在 ($modelSizeMB MB)"
-} elseif (-not $SkipDownload) {
-    Write-Info "下载 Whisper Large-v3-Turbo 模型 (~${modelSizeMB}MB)..."
-    Write-Info "这可能需要几分钟，请耐心等待..."
-    
-    $downloaded = Download-File -Url $modelUrl -OutFile $modelFile -Description "Whisper 模型"
-    if (-not $downloaded) {
-        Write-Fail "模型下载失败"
-        Write-Info "请手动下载模型并放置到: $ModelDir"
-        Write-Info "下载地址: $modelUrl"
+        # --- 下载 NPU 专用依赖（仅 NPU 机器）---
+        if ($hasNPU) {
+            foreach ($f in $npuDeps) {
+                $localPath = Join-Path $binDir $f.Name
+                if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
+                    Write-OK "$($f.Desc) 已存在，跳过下载"
+                    $downloadedFiles[$f.Name] = $true
+                    continue
+                }
+
+                $assetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/$($f.Name)"
+                Write-Info "下载 $($f.Desc) ..."
+
+                try {
+                    $tmpFile = "$localPath.download"
+                    Invoke-WebRequest -Uri $assetUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 300
+                    Move-Item -Path $tmpFile -Destination $localPath -Force
+                    Write-OK "$($f.Desc) 下载完成 ($(('{0:N2}' -f ((Get-Item $localPath).Length / 1MB))) MB)"
+                    $downloadedFiles[$f.Name] = $true
+                } catch {
+                    Write-Fail "$($f.Desc) 下载失败: $_"
+                    if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+                }
+            }
+
+            # --- 下载 whisper-server NPU 版 ---
+            $whisperLocalPath = Join-Path $binDir "whisper-server-npu.exe"
+            if (Test-Path $whisperLocalPath -and (Get-Item $whisperLocalPath).Length -gt 0) {
+                Write-OK "Whisper NPU Server 已存在，跳过下载"
+                $downloadedFiles["whisper-server-npu.exe"] = $true
+            } else {
+                $assetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/whisper-server-npu.exe"
+                Write-Info "下载 Whisper NPU Server ..."
+
+                try {
+                    $tmpFile = "$whisperLocalPath.download"
+                    Invoke-WebRequest -Uri $assetUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 300
+                    Move-Item -Path $tmpFile -Destination $whisperLocalPath -Force
+                    Write-OK "Whisper NPU Server 下载完成 ($(('{0:N2}' -f ((Get-Item $whisperLocalPath).Length / 1MB))) MB)"
+                    $downloadedFiles["whisper-server-npu.exe"] = $true
+                } catch {
+                    Write-Fail "Whisper NPU Server 下载失败: $_"
+                    if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+                }
+            }
+
+        } else {
+            # --- 非 NPU 机器：下载通用 whisper-server.exe ---
+            $whisperLocalPath = Join-Path $binDir "whisper-server.exe"
+            if (Test-Path $whisperLocalPath -and (Get-Item $whisperLocalPath).Length -gt 0) {
+                Write-OK "Whisper Server 已存在，跳过下载"
+                $downloadedFiles["whisper-server.exe"] = $true
+            } else {
+                $assetUrl = "https://github.com/$RepoOwner/$RepoName/releases/download/$tag/whisper-server.exe"
+                Write-Info "下载 Whisper Server (通用/CPU) ..."
+
+                try {
+                    $tmpFile = "$whisperLocalPath.download"
+                    Invoke-WebRequest -Uri $assetUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 300
+                    Move-Item -Path $tmpFile -Destination $whisperLocalPath -Force
+                    Write-OK "Whisper Server (通用/CPU) 下载完成 ($(('{0:N2}' -f ((Get-Item $whisperLocalPath).Length / 1MB))) MB)"
+                    $downloadedFiles["whisper-server.exe"] = $true
+                } catch {
+                    Write-Fail "Whisper Server 下载失败: $_"
+                    if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+                }
+            }
+        }
+
+    } catch {
+        Write-Fail "无法获取 GitHub Releases 信息: $_"
+        Write-Warn "请手动从以下地址下载并放置到 $binDir:"
+        Write-Info "https://github.com/$RepoOwner/$RepoName/releases/latest"
+    }
+} else {
+    Write-Info "跳过下载，检查本地文件..."
+    foreach ($f in $commonDeps) {
+        $localPath = Join-Path $binDir $f.Name
+        if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
+            Write-OK "$($f.Desc) 已存在"
+            $downloadedFiles[$f.Name] = $true
+        } else {
+            Write-Warn "$($f.Desc) 缺失: $localPath"
+        }
+    }
+    if ($hasNPU) {
+        foreach ($f in $npuDeps) {
+            $localPath = Join-Path $binDir $f.Name
+            if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
+                Write-OK "$($f.Desc) 已存在"
+                $downloadedFiles[$f.Name] = $true
+            } else {
+                Write-Warn "$($f.Desc) 缺失: $localPath"
+            }
+        }
+        $whisperLocalPath = Join-Path $binDir "whisper-server-npu.exe"
+        if (Test-Path $whisperLocalPath -and (Get-Item $whisperLocalPath).Length -gt 0) {
+            Write-OK "Whisper NPU Server 已存在"
+            $downloadedFiles["whisper-server-npu.exe"] = $true
+        } else {
+            Write-Warn "Whisper NPU Server 缺失: $whisperLocalPath"
+        }
+    } else {
+        $whisperLocalPath = Join-Path $binDir "whisper-server.exe"
+        if (Test-Path $whisperLocalPath -and (Get-Item $whisperLocalPath).Length -gt 0) {
+            Write-OK "Whisper Server 已存在"
+            $downloadedFiles["whisper-server.exe"] = $true
+        } else {
+            Write-Warn "Whisper Server 缺失: $whisperLocalPath"
+        }
     }
 }
 
 # ============================================================
-# 5. 生成配置文件
+# 5. 从第三方下载模型文件
+# ============================================================
+Write-Step "下载 Whisper 模型..."
+
+if ($ModelBaseUrl -eq "") {
+    Write-Warn "模型下载地址未配置（$ModelBaseUrl），请编辑脚本设置 \$ModelBaseUrl"
+    Write-Info "模型需要手动放置到: $binDir"
+} elseif (-not $SkipDownload) {
+    foreach ($f in $modelFiles) {
+        # NPU 编码器仅 NPU 机器需要
+        if ($f.OnlyNpu -and -not $hasNPU) {
+            Write-Info "跳过 $($f.Desc)（非 NPU 硬件不需要）"
+            continue
+        }
+
+        $localPath = Join-Path $binDir $f.Name
+        if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
+            Write-OK "$($f.Desc) ($($f.SizeMB)) 已存在，跳过下载"
+            $downloadedFiles[$f.Name] = $true
+            continue
+        }
+
+        $modelUrl = "$ModelBaseUrl$($f.Name)"
+        Write-Info "下载 $($f.Desc) ($($f.SizeMB)) ..."
+        Write-Info "  URL: $modelUrl"
+
+        try {
+            $tmpFile = "$localPath.download"
+            Invoke-WebRequest -Uri $modelUrl -OutFile $tmpFile -UseBasicParsing -TimeoutSec 600
+            Move-Item -Path $tmpFile -Destination $localPath -Force
+            Write-OK "$($f.Desc) ($($f.SizeMB)) 下载完成"
+            $downloadedFiles[$f.Name] = $true
+        } catch {
+            Write-Fail "$($f.Desc) 下载失败: $_"
+            if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force -ErrorAction SilentlyContinue }
+        }
+    }
+} else {
+    foreach ($f in $modelFiles) {
+        if ($f.OnlyNpu -and -not $hasNPU) { continue }
+        $localPath = Join-Path $binDir $f.Name
+        if (Test-Path $localPath -and (Get-Item $localPath).Length -gt 0) {
+            Write-OK "$($f.Desc) ($($f.SizeMB)) 已存在"
+            $downloadedFiles[$f.Name] = $true
+        } else {
+            Write-Warn "$($f.Desc) ($($f.SizeMB)) 缺失: $localPath"
+        }
+    }
+}
+
+# ============================================================
+# 6. 生成配置文件
 # ============================================================
 Write-Step "生成配置文件..."
 
-$configPath = "$env:APPDATA\voice2text.json"
+$configPath = "$InstallDir\voice2text.json"
+
+# 根据下载情况选择 whisper-server exe 和模型路径
+$selectedExeName = ""
+if ($downloadedFiles.ContainsKey("whisper-server-npu.exe")) {
+    $selectedExeName = "whisper-server-npu.exe"
+} elseif ($downloadedFiles.ContainsKey("whisper-server.exe")) {
+    $selectedExeName = "whisper-server.exe"
+}
+
+$whisperServerExe = ""
+$whisperModel = ""
+if ($selectedExeName) {
+    $whisperServerExe = (Join-Path $binDir $selectedExeName).Replace('\', '\\')
+}
+if ($downloadedFiles.ContainsKey("ggml-large-v3-turbo.bin")) {
+    $whisperModel = (Join-Path $binDir "ggml-large-v3-turbo.bin").Replace('\', '\\')
+}
+
 $config = @{
     key = "space"
     mod = ""
     hold_ms = 300
-    api = "http://localhost:13305/api/v1/audio/transcriptions"
-    model = "Whisper-Large-v3-Turbo"
-    api_key = ""
-    whisper_server_exe = $exePath.Replace('\', '\\')
+    whisper_server_exe = $whisperServerExe
     whisper_server_url = "http://127.0.0.1:8080/inference"
     whisper_server_port = 8080
-    whisper_cli = ""
-    whisper_model = $modelFile.Replace('\', '\\')
+    whisper_model = $whisperModel
     language = "zh"
     prompt = "以下是语音转写内容，使用简体中文，英文单词保持原文不要翻译，直接输出。"
     warn_recording_sec = 90
@@ -302,15 +426,15 @@ if ((Test-Path $configPath) -and -not $Force) {
 }
 
 # ============================================================
-# 6. 创建快捷方式
+# 7. 创建快捷方式
 # ============================================================
 Write-Step "创建快捷方式..."
 
 $desktopPath = [Environment]::GetFolderPath("Desktop")
 $shortcutPath = "$desktopPath\voice2text.lnk"
-$exeFullPath = if (Test-Path $exePath) { $exePath } else { "$InstallDir\voice2text.exe" }
+$exeFullPath = if (Test-Path "$InstallDir\voice2text.exe") { "$InstallDir\voice2text.exe" } else { Write-Warn "未找到 voice2text.exe，请先编译或下载主程序" }
 
-if (Test-Path $exeFullPath) {
+if ($exeFullPath) {
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($shortcutPath)
     $shortcut.TargetPath = $exeFullPath
@@ -318,13 +442,10 @@ if (Test-Path $exeFullPath) {
     $shortcut.Description = "语音转文字工具"
     $shortcut.Save()
     Write-OK "桌面快捷方式已创建: $shortcutPath"
-} else {
-    Write-Warn "可执行文件不存在，跳过快捷方式创建"
-    Write-Info "请先编译或下载 voice2text.exe"
 }
 
 # ============================================================
-# 7. 编译（如果从源码安装）
+# 8. 编译（如果从源码安装）
 # ============================================================
 $sourceDir = Split-Path -Parent $PSScriptRoot
 $sourceGoFile = Join-Path $sourceDir "main.go"
@@ -333,15 +454,15 @@ $compiledExe = Join-Path $sourceDir "voice2text.exe"
 if ((Test-Path $sourceGoFile) -and $hasGo) {
     Write-Step "从源码编译..."
     Write-Info "检测到源码目录，正在编译..."
-    
+
     Push-Location $sourceDir
     try {
         $env:CGO_ENABLED = "0"
         $env:GOOS = "windows"
         $env:GOARCH = "amd64"
-        
+
         go build -ldflags="-H windowsgui" -o voice2text.exe . 2>&1 | ForEach-Object { Write-Info $_ }
-        
+
         if ($LASTEXITCODE -eq 0 -and (Test-Path $compiledExe)) {
             Copy-Item $compiledExe "$InstallDir\voice2text.exe" -Force
             Write-OK "编译成功: $InstallDir\voice2text.exe"
@@ -356,7 +477,7 @@ if ((Test-Path $sourceGoFile) -and $hasGo) {
 }
 
 # ============================================================
-# 8. 完成
+# 9. 完成
 # ============================================================
 Write-Host "`n" -NoNewline
 Write-Host "============================================" -ForegroundColor Green
@@ -380,10 +501,28 @@ if ($hasGPU) {
 }
 Write-Host "  CPU: $cpuName" -ForegroundColor Gray
 
+Write-Host "`n下载摘要:" -ForegroundColor White
+$allFiles = @($commonDeps) + @($npuDeps | Where-Object { $hasNPU }) + @(,@{ Name = if ($hasNPU) { "whisper-server-npu.exe" } else { "whisper-server.exe" }; Desc = if ($hasNPU) { "Whisper NPU Server (专用)" } else { "Whisper Server (通用/CPU)" }}) + @($modelFiles | Where-Object { -not $_.OnlyNpu -or $hasNPU })
+$successCount = 0
+$failCount = 0
+foreach ($f in $allFiles) {
+    if ($downloadedFiles.ContainsKey($f.Name)) {
+        Write-Host "  [OK] $($f.Desc)" -ForegroundColor Green
+        $successCount++
+    } else {
+        Write-Host "  [X] $($f.Desc)" -ForegroundColor Red
+        $failCount++
+    }
+}
+
 Write-Host "`n下一步:" -ForegroundColor Yellow
-Write-Host "  1. 双击桌面快捷方式启动" -ForegroundColor White
+Write-Host "  1. 双击桌面快捷方式启动（或运行 $InstallDir\voice2text.exe）" -ForegroundColor White
 Write-Host "  2. 右键托盘图标可切换快捷键" -ForegroundColor White
 Write-Host "  3. 长按快捷键开始录音" -ForegroundColor White
 
+if ($failCount -gt 0) {
+    Write-Host "`n[!] $failCount 个文件下载失败，请检查日志或手动放置到: $binDir" -ForegroundColor Yellow
+}
+
 Write-Host "`n如需帮助，请访问:" -ForegroundColor Gray
-Write-Host "  https://github.com/lisiyu/voice2text-go" -ForegroundColor Cyan
+Write-Host "  https://github.com/$RepoOwner/$RepoName" -ForegroundColor Cyan

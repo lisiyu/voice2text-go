@@ -160,8 +160,11 @@ func defaultCfg() Config {
 }
 
 func cfgPath() string {
-	dir, _ := os.UserConfigDir()
-	return filepath.Join(dir, "voice2text.json")
+	exe, err := os.Executable()
+	if err != nil {
+		return "voice2text.json"
+	}
+	return filepath.Join(filepath.Dir(exe), "voice2text.json")
 }
 
 func loadCfg() Config {
