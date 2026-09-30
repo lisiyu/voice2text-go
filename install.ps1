@@ -325,7 +325,7 @@ if (-not $SkipDownload) {
 
     } catch {
         Write-Fail "无法获取 GitHub Releases 信息: $_"
-        Write-Warn "请手动从以下地址下载并放置到 $binDir:"
+        Write-Warn "请手动从以下地址下载并放置到 ${binDir}:"
         Write-Info "https://github.com/$RepoOwner/$RepoName/releases/latest"
     }
 } else {
