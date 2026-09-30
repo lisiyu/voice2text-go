@@ -9,7 +9,7 @@
 #>
 
 param(
-    [string]$InstallDir = "$env:LOCALAPPDATA\voice2text-go",
+    [string]$InstallDir = "$env:USERPROFILE\voice2text-go",
     [switch]$SkipDownload,
     [switch]$Force
 )
