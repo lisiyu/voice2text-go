@@ -65,6 +65,9 @@ $BuiltinHashes = @{
     "cpu-ggml-cpu-cascadelake.dll" = "DDF49BB749B34800AFCB3D6224544966A05C5D00F1D0B6565BEE9F3B010DD53C"
     "cpu-ggml-cpu-cannonlake.dll"  = "2C858781450B52EDA95C381232CC65C9E19CBF621CC7B254D8C44FDBAB77791E"
     "cpu-ggml-cpu-alderlake.dll"   = "5A5B11DCD38E321B13F85C95414940DB9EAB1132BE3DA6342F03DFB1D8E51BD5"
+    # --- 模型（HuggingFace 不可变文件）---
+    "ggml-large-v3-turbo.bin"                    = "1FC70F774D38EB169993AC391EEA357EF47C88757EF72EE5943879B7E8E2BC69"
+    "ggml-large-v3-turbo-encoder-vitisai.rai"    = "C73BBABC7210CCC64376E81BBFFB5B397B6B4FF5F5020D5CCA90ED815C6708D0"
 }
 
 # 合并内置表与用户传入的覆盖项
@@ -106,12 +109,17 @@ function Test-Command {
     $null -ne (Get-Command $Command -ErrorAction SilentlyContinue)
 }
 
-# 校验 SHA256。哈希表中无该文件时记警告并跳过。
+# 校验 SHA256。哈希表中无该文件时：-Quiet 则仅记一行提示，否则记警告。
+# 注：主程序 voice2text.exe 每次 CI 构建的哈希都不同，故不内置，固定传 -Quiet。
 function Test-FileHash {
-    param([string]$Path, [string]$FileName, [string]$Desc)
+    param([string]$Path, [string]$FileName, [string]$Desc, [switch]$Quiet)
     $expected = $EffectiveHashes[$FileName]
     if ([string]::IsNullOrWhiteSpace($expected)) {
-        Write-Warn "$Desc 无内置 SHA256，跳过完整性校验"
+        if ($Quiet) {
+            Write-Info "$Desc 无固定哈希（每次构建不同），已按尺寸校验"
+        } else {
+            Write-Warn "$Desc 无内置 SHA256，跳过完整性校验"
+        }
         return $true
     }
     try {
@@ -147,7 +155,8 @@ function Get-RemoteFile {
         [string]$FileName,
         [string]$Desc,
         [int64]$ExpectedSize = 0,
-        [int]$TimeoutSec = 900
+        [int]$TimeoutSec = 900,
+        [switch]$Quiet
     )
 
     if (-not $SkipDownload -and $Force -and (Test-Path $Dest)) {
@@ -180,7 +189,7 @@ function Get-RemoteFile {
             if (-not (Test-FileSize -Path $Dest -ExpectedSize $ExpectedSize -Desc $Desc)) {
                 throw "尺寸校验失败"
             }
-            if (-not (Test-FileHash -Path $Dest -FileName $FileName -Desc $Desc)) {
+            if (-not (Test-FileHash -Path $Dest -FileName $FileName -Desc $Desc -Quiet:$Quiet)) {
                 throw "SHA256 校验失败"
             }
 
@@ -477,7 +486,7 @@ if ($sourceGoFile -and $hasGo -and -not $SkipDownload) {
 if (-not $readyFiles.ContainsKey($AppExeName)) {
     $exeUrls = @()
     if ($releaseTag) { $exeUrls += (New-ReleaseUrl $AppExeName) }
-    if (Get-RemoteFile -Urls $exeUrls -Dest $appExePath -FileName $AppExeName -Desc "主程序 $AppExeName" -TimeoutSec 600) {
+    if (Get-RemoteFile -Urls $exeUrls -Dest $appExePath -FileName $AppExeName -Desc "主程序 $AppExeName" -TimeoutSec 600 -Quiet) {
         $readyFiles[$AppExeName] = $true
     }
 }
@@ -503,13 +512,16 @@ if ($readyFiles.ContainsKey("whisper-server-npu.exe")) {
     $selectedExeName = "whisper-server.exe"
 }
 
+# 注意：不要对路径做 .Replace('\','\\')。PowerShell 的 ConvertTo-Json 本身就会把
+# 反斜杠转义成 \\，手动再转义一次会得到 \\\\" ，反序列化后变成含双反斜杠的
+# 非法路径，导致主程序找不到 whisper-server。
 $whisperServerExe = ""
 $whisperModel = ""
 if ($selectedExeName) {
-    $whisperServerExe = (Join-Path $binDir $selectedExeName).Replace('\', '\\')
+    $whisperServerExe = Join-Path $binDir $selectedExeName
 }
 if ($readyFiles.ContainsKey("ggml-large-v3-turbo.bin")) {
-    $whisperModel = (Join-Path $binDir "ggml-large-v3-turbo.bin").Replace('\', '\\')
+    $whisperModel = Join-Path $binDir "ggml-large-v3-turbo.bin"
 }
 
 $config = [ordered]@{
