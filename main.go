@@ -485,8 +485,11 @@ func transcribeInternal(pcm []byte, precheck bool) (string, error) {
 	}
 	// 选择了本地常驻方案
 	if c.WhisperServerExe != "" {
-		if precheck && !whisperServerHealthy(c) {
-			return "", fmt.Errorf("本地 NPU 转写服务未就绪（/health 不通，端口 %d），请确认 voice2text 已正常启动", orDefaultInt(c.WhisperServerPort, defaultWhisperPort))
+		// 预检通过自愈恢复：server 因外部原因消失时自动重启，不再要求用户手动重启应用
+		if precheck {
+			if err := ensureWhisperServer(c); err != nil {
+				return "", err
+			}
 		}
 		return transcribeServer(pcm, c)
 	}
@@ -509,9 +512,11 @@ func transcribeSplit(pcm []byte, c *Config) (string, error) {
 	if len(chunks) <= 1 {
 		return transcribe(chunks[0])
 	}
-	// 入口预检：server 后端只健康检查一次；若服务未就绪，所有子段都会失败，无需并发轰炸
-	if c.WhisperServerExe != "" && !whisperServerHealthy(c) {
-		return "", fmt.Errorf("本地 NPU 转写服务未就绪（/health 不通，端口 %d）", orDefaultInt(c.WhisperServerPort, defaultWhisperPort))
+	// 入口预检：server 后端先健康检查（不通则自愈重启）；子段用 precheck=false 跳过，避免并发轰炸
+	if c.WhisperServerExe != "" {
+		if err := ensureWhisperServer(c); err != nil {
+			return "", err
+		}
 	}
 	logf("长音频: 总时长 %.1fs，按 30s 切片为 %d 段转写", PCMSeconds(pcm), len(chunks))
 	type chunkResult struct {
@@ -613,6 +618,13 @@ func startWhisperServer(c *Config) error {
 		return fmt.Errorf("启动 whisper-server 失败: %w", err)
 	}
 	wsMu.Lock()
+	// 走到这里说明旧实例既不健康、端口也已释放（多半是外部被杀的死进程）。
+	// 必须释放旧句柄：exec.Cmd 未 Wait/Release 前 Go 会一直持有 OS 句柄，
+	// 每次自愈都覆盖而不回收会持续泄漏。
+	if wsProc != nil && wsProc.Process != nil {
+		_ = wsProc.Process.Kill() // 已退出则返回错误，无害
+		_, _ = wsProc.Process.Wait()
+	}
 	wsProc = cmd
 	wsMu.Unlock()
 	logf("whisper-server 已启动 pid=%d (port=%d)，等待 /health 就绪...", cmd.Process.Pid, port)
@@ -640,7 +652,10 @@ func startWhisperServer(c *Config) error {
 
 // restartWhisperServer 杀掉当前 whisper-server 并在后台启动新实例（配置热重载后端变更时使用）。
 // 新实例就绪后由 startWhisperServer 内部等待，失败仅记日志不阻断。
+// 与 ensureWhisperServer 共用 wsLifecycleMu，避免热重启与转写自愈同时拉起两个实例。
 func restartWhisperServer(c *Config) {
+	wsLifecycleMu.Lock()
+	defer wsLifecycleMu.Unlock()
 	wsMu.Lock()
 	if wsProc != nil && wsProc.Process != nil {
 		logf("restartWhisperServer: 杀掉当前实例 pid=%d", wsProc.Process.Pid)
@@ -654,6 +669,50 @@ func restartWhisperServer(c *Config) {
 	} else {
 		logf("restartWhisperServer: 新实例已就绪")
 	}
+}
+
+// ---------- 转写前自愈 ----------
+// ensureWhisperServer 在转写前确认本地 whisper-server 可用。
+//
+// 背景：whisper-server 可能因外部原因消失（被清理、父进程被 taskkill、机器休眠等）。
+// 此前 /health 不通就直接返回错误，导致 server 一掉转写永久失败，必须重启应用。
+// 现在改为先健康检查（正常路径零开销），不通则自愈重启。
+//
+// 冷却窗口：自愈失败后 60s 内不再重试，避免每次转写都阻塞在 90s 启动等待上，
+// 用户能快速看到失败提示而不是长时间卡住。
+const ensureCooldown = 60 * time.Second
+
+var (
+	wsLifecycleMu sync.Mutex // 串行化 server 生命周期变更（自愈 / 配置热重启），防止并发拉起两个实例
+	ensureFailed  time.Time  // 上次自愈失败时间（成功不记录）
+)
+
+func ensureWhisperServer(c *Config) error {
+	// 快路径：健康则零开销直接放行（每次转写都会走到这里）
+	if whisperServerHealthy(c) {
+		return nil
+	}
+	if c.WhisperServerExe == "" || c.WhisperModel == "" {
+		return fmt.Errorf("本地 NPU 转写服务未就绪（/health 不通，端口 %d）",
+			orDefaultInt(c.WhisperServerPort, defaultWhisperPort))
+	}
+	wsLifecycleMu.Lock()
+	defer wsLifecycleMu.Unlock()
+	// 双重检查：排队期间可能已被并发恢复
+	if whisperServerHealthy(c) {
+		return nil
+	}
+	if !ensureFailed.IsZero() && time.Since(ensureFailed) < ensureCooldown {
+		remain := int((ensureCooldown - time.Since(ensureFailed)).Seconds()) + 1
+		return fmt.Errorf("本地 NPU 转写服务未就绪（/health 不通，端口 %d），%ds 后自动重试",
+			orDefaultInt(c.WhisperServerPort, defaultWhisperPort), remain)
+	}
+	logf("转写前 /health 不通，自愈重启 whisper-server（模型加载可能需要数秒）")
+	if err := startWhisperServer(c); err != nil {
+		ensureFailed = time.Now()
+		return fmt.Errorf("本地 NPU 转写服务自愈失败: %w", err)
+	}
+	return nil
 }
 
 // whisperServerAlive 探测本地 whisper-server 端口是否存活（仅 TCP，不代表模型已就绪）
