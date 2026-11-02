@@ -201,13 +201,7 @@ func showTrayMenu(hwnd windows.Handle) {
 	procDestroyMenu.Call(hMenu)
 }
 
-func currentKeyName() string {
-	c := cfg()
-	if c == nil {
-		return "space"
-	}
-	return c.Key
-}
+// currentKeyName 见 main.go（平台共享）。
 
 // WNDCLASSEXW 与 C 布局完全一致（含 hIconSm）
 type wndClassEx struct {

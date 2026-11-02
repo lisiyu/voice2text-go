@@ -65,6 +65,28 @@ go build -ldflags="-H windowsgui" -o voice2text.exe .
 3. 确保 `bin/` 目录包含 whisper-server 和模型文件
 4. 运行 `voice2text.exe`
 
+## Linux 版
+
+已在 Ubuntu 26.04 + GNOME 50.1 + Wayland 真机上实测通过（2026-11-03）。
+与 README_CN.md 的 Linux 一节内容一致，此处只列要点，完整说明见中文版：
+
+- **安装**：交付包已含预编译的 `voice2text` 与 whisper 后端，解压后执行
+  `./install.sh`（默认装到 `~/voice2text`）。脚本负责依赖检查、
+  `wtype`/`wl-clipboard` 安装（无 sudo 时免 root 装到 `~/.local/bin`）、
+  文件落位、模型获取、自启动与 GNOME 快捷键绑定（Ctrl+Alt+V）。
+- **用法（Wayland）**：按 Ctrl+Alt+V 开始，再按一次停止并转写（toggle 语义）；
+  转写后文本进剪贴板，托盘状态与通知提示“已复制到剪贴板，请按 Ctrl+V 粘贴”，
+  在目标输入框按 Ctrl+V 粘贴。`voice2text toggle` 子命令亦可直接触发。
+- **用法（X11）**：全局热键（默认 space）+ 自动 Ctrl+V 粘贴；
+  **X11 路径未在真机验证**（真机为 Wayland）。
+- **托盘**：需 AppIndicator 扩展；Wayland 下新启用的扩展需注销重登录后才载入。
+- **已知限制**：GNOME 下 `wtype` 不能打字（Mutter 不实现 virtual-keyboard 协议），
+  自动打字降级为剪贴板 + 手动 Ctrl+V；悬浮窗波形改为托盘状态 + 通知；
+  Linux 不需要 api_key；后端默认端口 18080（避开 llama-server 常驻的 8080，
+  探活校验 `Server: whisper.cpp` 头）。
+- **日志**：应用 `/tmp/voice2text.log`，后端 `/tmp/whisper-server.log`；
+  健康检查 `curl http://127.0.0.1:18080/health`。
+
 ## 配置说明
 
 配置文件自动创建在 `%AppData%\voice2text.json`：

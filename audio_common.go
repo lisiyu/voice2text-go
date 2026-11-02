@@ -1,62 +1,27 @@
-//go:build windows
-
 package main
 
-// audio.go - 录音：winmm.dll waveIn 原生 API（纯 Go，无 CGO）
+// audio_common.go - 录音共享部分（平台无关）。
+// Recorder 的平台相关状态放在 recorderSys 里，
+// 由 audio_windows.go / audio_linux.go 各自定义。
+
 import (
-	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
-	"unsafe"
-)
-
-var (
-	winmm                 = syscall.NewLazyDLL("winmm.dll")
-	waveInOpen            = winmm.NewProc("waveInOpen")
-	waveInClose           = winmm.NewProc("waveInClose")
-	waveInPrepareHeader   = winmm.NewProc("waveInPrepareHeader")
-	waveInUnprepareHeader = winmm.NewProc("waveInUnprepareHeader")
-	waveInAddBuffer       = winmm.NewProc("waveInAddBuffer")
-	waveInStart           = winmm.NewProc("waveInStart")
-	waveInStop            = winmm.NewProc("waveInStop")
-	waveInReset           = winmm.NewProc("waveInReset")
 )
 
 const (
-	WAVE_MAPPER = uint32(0xFFFFFFFF)
-	WHDR_DONE   = 0x1
-	SR          = 16000 // 采样率
+	SR = 16000 // 采样率
 )
 
-type waveFormatEx struct {
-	wFormatTag      uint16
-	nChannels       uint16
-	nSamplesPerSec  uint32
-	nAvgBytesPerSec uint32
-	nBlockAlign     uint16
-	wBitsPerSample  uint16
-	cbSize          uint16
-}
+const ovWaveBars = 48 // 悬浮窗波形条数（环形缓冲深度，约 1.5s 历史）
 
-type waveHdr struct {
-	lpData          uintptr
-	dwBufferLength  uint32
-	dwBytesRecorded uint32
-	dwUser          uintptr
-	dwFlags         uint32
-	dwLoops         uint32
-	lpNext          uintptr
-	reserved        uintptr
-}
+const bufBytes = SR / 4 // 0.125 秒 @16k/16bit/mono = 4000 字节（小缓冲→高频刷新，波形才"动"）
 
-// Recorder 封装 waveIn 录音
+// Recorder 封装录音。Start/Stop/readLoop 由平台实现，
+// 能量统计与 PCM 工具函数共享。
 type Recorder struct {
-	handle   uintptr
-	bufs     [][]byte
-	hdrs     []*waveHdr
 	mu       sync.Mutex
 	data     []byte
 	running  atomic.Bool
@@ -68,77 +33,8 @@ type Recorder struct {
 	lvCount int
 	lvMu    sync.Mutex
 	lastRMS int32 // 最近一次 RMS（0~32767）
-}
 
-const ovWaveBars = 48 // 悬浮窗波形条数（环形缓冲深度，约 1.5s 历史）
-
-const bufBytes = SR / 4 // 0.125 秒 @16k/16bit/mono = 4000 字节（小缓冲→高频刷新，波形才"动"）
-
-// Start 打开麦克风并开始录音
-func (r *Recorder) Start() error {
-	f := waveFormatEx{
-		wFormatTag:      1, // PCM
-		nChannels:       1,
-		nSamplesPerSec:  SR,
-		nAvgBytesPerSec: SR * 2,
-		nBlockAlign:     2,
-		wBitsPerSample:  16,
-	}
-	var h uintptr
-	r1, _, _ := waveInOpen.Call(
-		uintptr(unsafe.Pointer(&h)), uintptr(WAVE_MAPPER),
-		uintptr(unsafe.Pointer(&f)), 0, 0, 0,
-	)
-	if r1 != 0 {
-		return fmt.Errorf("waveInOpen failed: %d", r1)
-	}
-	r.handle = h
-	r.running.Store(true)
-	r.recStart = time.Now()
-	hdrSize := unsafe.Sizeof(waveHdr{})
-	for i := 0; i < 8; i++ {
-		b := make([]byte, bufBytes)
-		// 必须用堆分配的 hdr（指针固定），否则 append 移动底层数组会让 waveIn 持有的指针失效
-		hdr := &waveHdr{lpData: uintptr(unsafe.Pointer(&b[0])), dwBufferLength: bufBytes}
-		waveInPrepareHeader.Call(h, uintptr(unsafe.Pointer(hdr)), hdrSize)
-		waveInAddBuffer.Call(h, uintptr(unsafe.Pointer(hdr)), hdrSize)
-		r.bufs = append(r.bufs, b)
-		r.hdrs = append(r.hdrs, hdr)
-	}
-	waveInStart.Call(h)
-	go r.readLoop()
-	return nil
-}
-
-// readLoop 轮询已满的缓冲区，拷出数据并重新投递
-func (r *Recorder) readLoop() {
-	hdrSize := unsafe.Sizeof(waveHdr{})
-	for r.running.Load() {
-		for i := range r.hdrs {
-			if r.hdrs[i].dwFlags&WHDR_DONE != 0 {
-				n := int(r.hdrs[i].dwBytesRecorded)
-				if n > 0 {
-					r.mu.Lock()
-					r.data = append(r.data, r.bufs[i][:n]...)
-					r.mu.Unlock()
-					// 实时能量：把该缓冲细分为多个子窗口，逐个算 RMS 写入环形缓冲，
-					// 这样悬浮窗波形刷新率从 2Hz 提到 ~32Hz（肉眼才看得到跳动）。
-					const subN = 4
-					step := n / subN
-					if step < 4 {
-						step = 4
-					}
-					for s := 0; s+step <= n; s += step {
-						r.pushLevel(rms(r.bufs[i][s : s+step]))
-					}
-				}
-				r.hdrs[i].dwBytesRecorded = 0
-				r.hdrs[i].dwFlags &^= WHDR_DONE
-				waveInAddBuffer.Call(r.handle, uintptr(unsafe.Pointer(r.hdrs[i])), hdrSize)
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	sys recorderSys // 平台相关状态（句柄 / 子进程等）
 }
 
 // pushLevel 把一次 RMS 采样写入环形缓冲（容量为 ovWaveBars）
@@ -184,33 +80,12 @@ func (r *Recorder) Levels() []int32 {
 	return buf[:]
 }
 
-// Stop 停止并返回 16k/16bit/mono PCM 数据
-func (r *Recorder) Stop() ([]byte, error) {
-	r.running.Store(false)
-	waveInStop.Call(r.handle)
-	time.Sleep(50 * time.Millisecond) // 让残余缓冲落盘
-
-	// 收尾采集
-	for i := range r.hdrs {
-		if r.hdrs[i].dwFlags&WHDR_DONE != 0 {
-			n := r.hdrs[i].dwBytesRecorded
-			if n > 0 {
-				r.mu.Lock()
-				r.data = append(r.data, r.bufs[i][:n]...)
-				r.mu.Unlock()
-			}
-		}
+// Elapsed 返回当前录音已进行时长（秒）
+func (r *Recorder) Elapsed() float64 {
+	if r.recStart.IsZero() {
+		return 0
 	}
-	// 必须先 Unprepare 所有 header，再 Reset/Close，否则内核多媒体资源泄漏
-	hdrSize := unsafe.Sizeof(waveHdr{})
-	for i := range r.hdrs {
-		waveInUnprepareHeader.Call(r.handle, uintptr(unsafe.Pointer(r.hdrs[i])), hdrSize)
-	}
-	waveInReset.Call(r.handle)
-	waveInClose.Call(r.handle)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.data, nil
+	return time.Since(r.recStart).Seconds()
 }
 
 // WAVBytes 把 PCM 包装成 WAV 文件字节
@@ -281,14 +156,6 @@ func CurrentLevels() []int32 {
 		return zeroLevels[:]
 	}
 	return r.Levels()
-}
-
-// Elapsed 返回当前录音已进行时长（秒）
-func (r *Recorder) Elapsed() float64 {
-	if r.recStart.IsZero() {
-		return 0
-	}
-	return time.Since(r.recStart).Seconds()
 }
 
 // CurrentElapsed 返回当前录音已进行时长（秒，无录音返回 0），供悬浮窗显示进度

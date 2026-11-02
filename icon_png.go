@@ -1,5 +1,5 @@
-//go:build windows
-
+// icon_png.go - 程序化 PNG/ICO 图标生成（纯 Go，平台共享；
+// Linux 托盘直接用 PNG，Windows 托盘用 PNG-in-ICO）。
 package main
 
 import (

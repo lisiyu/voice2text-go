@@ -1,5 +1,5 @@
-//go:build windows
-
+// backend.go - 转写后端探测/下载/安装（平台共享，
+// 平台差异经 platformExeName / hiddenProcAttr / killStaleWhisperServer 隔离）。
 package main
 
 import (
@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -105,8 +104,9 @@ func backendDir(dir string) string {
 }
 
 // resolveExe / resolveModel 返回某后端 exe / 模型在本机的绝对路径。
+// ExeName 经 platformExeName 换算：Windows 原样（含 .exe），Linux 去掉 .exe 后缀。
 func resolveExe(b whisperBackend, dir string) string {
-	return filepath.Join(backendDir(dir), b.ExeName)
+	return filepath.Join(backendDir(dir), platformExeName(b.ExeName))
 }
 func resolveModel(b whisperBackend, dir string) string {
 	return filepath.Join(backendDir(dir), b.ModelName)
@@ -214,7 +214,7 @@ func probeWhisperServer(exe, model string, port int) bool {
 	}
 	cmd := exec.Command(exe, "--host", "127.0.0.1", "--port", fmt.Sprintf("%d", port),
 		"-m", model, "-l", "zh", "-t", fmt.Sprintf("%d", nThreads))
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.SysProcAttr = hiddenProcAttr()
 	if err := cmd.Start(); err != nil {
 		return false
 	}
@@ -406,6 +406,6 @@ func runInstall(dir, manifestURL string) error {
 	c.AutoBackend = true // 下次启动仍按环境自动回退
 	saveCfg(c)
 	fmt.Fprintf(os.Stderr, "[完成] 已选用 %s\n  exe  : %s\n  model: %s\n  配置已写入 %s\n", b.Label, exe, model, cfgPath())
-	fmt.Fprintf(os.Stderr, "[提示] 直接运行 voice2text.exe 即可（常驻转写服务会随启动自动拉起）。\n")
+	fmt.Fprintf(os.Stderr, "[提示] 直接运行 %s 即可（常驻转写服务会随启动自动拉起）。\n", binaryName())
 	return nil
 }

@@ -152,22 +152,17 @@ var (
 	ovFontSmall   uintptr
 
 	// 精致 PNG 图标缓存（HBITMAP + 尺寸）
-	iconMic     uintptr
-	iconMicW    int32
-	iconCheck   uintptr
-	iconCheckW  int32
-	iconWarn    uintptr
-	iconWarnW   int32
+	iconMic    uintptr
+	iconMicW   int32
+	iconCheck  uintptr
+	iconCheckW int32
+	iconWarn   uintptr
+	iconWarnW  int32
 )
 
 var iconsOnce sync.Once
 
-const (
-	stRecord = 0
-	stTrans  = 1
-	stOK     = 2
-	stWarn   = 3
-)
+// stRecord/stTrans/stOK/stWarn 见 overlay_states.go（平台共享）。
 
 // rgb 转 GDI BGR
 func bgr(r, g, b uint8) uint32 {

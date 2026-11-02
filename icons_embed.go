@@ -1,5 +1,4 @@
-//go:build windows
-
+// icons_embed.go - 内嵌精致图标 PNG（平台共享）。
 package main
 
 import _ "embed"

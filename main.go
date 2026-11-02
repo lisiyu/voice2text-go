@@ -1,10 +1,13 @@
-//go:build windows
-
+// main.go - 共享逻辑（平台无关）。
+// 平台专属实现见 *_windows.go / *_linux.go：
+// 热键钩子/抓键、按键码映射、录音、托盘、悬浮窗、
+// 粘贴输出、单实例锁、api_key 编解码、子进程属性。
 package main
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -19,12 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
-	"unsafe"
-
-	"github.com/atotto/clipboard"
-	"golang.org/x/sys/windows"
 )
 
 // ---------- 配置（支持自定义语音接口） ----------
@@ -37,8 +35,8 @@ type Config struct {
 	APIKey string `json:"api_key"` // 可选：接口需要的 Bearer Token（留空则不携带）
 	// 本地常驻 whisper-server（NPU 加速，不依赖任何三方服务；优先于 cli/API）
 	WhisperServerExe  string `json:"whisper_server_exe"`  // whisper-server.exe 完整路径（留空则走 cli/API）
-	WhisperServerURL  string `json:"whisper_server_url"`  // 常驻服务地址，默认 http://127.0.0.1:8080/inference
-	WhisperServerPort int    `json:"whisper_server_port"` // 常驻端口，默认 8080
+	WhisperServerURL  string `json:"whisper_server_url"`  // 常驻服务地址，默认 http://127.0.0.1:<平台端口>/inference
+	WhisperServerPort int    `json:"whisper_server_port"` // 常驻端口，默认见 defaultWhisperPort（Windows 8080 / Linux 18080）
 	// whisper-cli 直转写（本地兜底；设置了就优先于 API）
 	WhisperCLI   string `json:"whisper_cli"`   // whisper-cli.exe 完整路径（留空则用 API）
 	WhisperModel string `json:"whisper_model"` // ggml 模型完整路径
@@ -67,74 +65,16 @@ type Config struct {
 	WhisperBackend string `json:"whisper_backend"`
 }
 
-// defaultWhisperPort whisper-server 默认端口（全项目统一，避免 8080/19743 混用）
-const defaultWhisperPort = 8080
+// defaultWhisperPort whisper-server 默认端口，按平台定义
+// （见 platform_windows.go / platform_linux.go）：
+// Windows 保持 8080；Linux 用 18080，避开本机常驻的 llama-server
+// （llama.cpp server 默认占 8080，且它的 /health 也回 200 + {"status":"ok"}，
+// 曾导致探活误判为 whisper-server 而复用错服务，见 whisperServerHealthy）。
 
-var vkMap = map[string]uintptr{
-	"space":      0x20,
-	"f8":         0x77,
-	"f9":         0x78,
-	"leftshift":  0xA0,
-	"rightshift": 0xA1,
-	"leftctrl":   0xA2,
-	"rightctrl":  0xA3,
-	"leftalt":    0xA4,
-	"rightalt":   0xA5,
-	"capslock":   0x14,
-	"home":       0x24,
-	"end":        0x23,
-	"insert":     0x2D,
-	"tab":        0x09,
-	"enter":      0x0D,
-	"delete":     0x2E,
-	"left":       0x25,
-	"right":      0x27,
-	"up":         0x26,
-	"down":       0x28,
-}
-
-// vkForName 支持预设名 + 任意字母/数字/F1-F24
-func vkForName(name string) uintptr {
-	name = strings.ToLower(strings.TrimSpace(name))
-	if v, ok := vkMap[name]; ok {
-		return v
-	}
-	if len(name) == 1 {
-		c := name[0]
-		if c >= 'a' && c <= 'z' {
-			return uintptr(0x41 + c - 'a')
-		}
-		if c >= '0' && c <= '9' {
-			return uintptr(0x30 + c - '0')
-		}
-	}
-	if len(name) > 1 && name[0] == 'f' {
-		var num int
-		if _, err := fmt.Sscanf(name[1:], "%d", &num); err == nil && num >= 1 && num <= 24 {
-			return uintptr(0x6F + num)
-		}
-	}
-	return 0
-}
-
-// vkToName 反向映射
-func vkToName(vk uintptr) string {
-	for name, v := range vkMap {
-		if v == vk {
-			return name
-		}
-	}
-	if vk >= 0x41 && vk <= 0x5A {
-		return string(rune('A' + vk - 0x41))
-	}
-	if vk >= 0x30 && vk <= 0x39 {
-		return string(rune('0' + vk - 0x30))
-	}
-	if vk >= 0x70 && vk <= 0x87 {
-		return fmt.Sprintf("f%d", vk-0x6F)
-	}
-	return ""
-}
+// 按键名 ↔ 平台按键码的映射见 keys_windows.go / keys_linux.go：
+// Windows 用 VK 码，Linux 用 X11 keysym；名字集合保持一致
+// （space/f8/f9/左右ctrl/shift/alt、capslock、home、end、insert 等）。
+// vkForName/vkToName 由平台文件提供，共享代码只按名字调用。
 
 func defaultCfg() Config {
 	// 模型与语音服务默认与软件安装在同一目录（<exe 所在目录>\bin\），
@@ -142,23 +82,24 @@ func defaultCfg() Config {
 	// 不再硬编码 lemonade 缓存路径：旧默认指向用户机器上可能根本不存在的
 	// 路径，会导致录音正常、最后一步转写报"服务未就绪"失败。
 	binDir := backendDir("")
-	// NPU>GPU>CPU>通用：已存在哪个用哪个；都不存在时给通用名（安装器按机器类型下载对应 exe）。
-	serverExe := filepath.Join(binDir, "whisper-server.exe")
+	// NPU>GPU>CPU>通用：已存在哪个用哪个；都不存在时给通用名（安装器按机器类型下载对应后端）。
+	// 文件名经 platformExeName 换算：Windows 带 .exe 后缀，Linux 不带。
+	serverExe := filepath.Join(binDir, platformExeName("whisper-server.exe"))
 	for _, name := range []string{"whisper-server-npu.exe", "whisper-server-vulkan.exe", "whisper-server-cpu.exe"} {
-		if fileExists(filepath.Join(binDir, name)) {
-			serverExe = filepath.Join(binDir, name)
+		if fileExists(filepath.Join(binDir, platformExeName(name))) {
+			serverExe = filepath.Join(binDir, platformExeName(name))
 			break
 		}
 	}
 
 	return Config{Key: "space", Mod: "", HoldMs: 300,
 		WhisperServerExe:  serverExe,
-		WhisperServerURL:  "http://127.0.0.1:8080/inference",
-		WhisperServerPort: 8080,
-		// 模型与语音服务同目录：安装器下载到 bin\ 的 ggml-large-v3-turbo.bin
+		WhisperServerURL:  fmt.Sprintf("http://127.0.0.1:%d/inference", defaultWhisperPort),
+		WhisperServerPort: defaultWhisperPort,
+		// 模型与语音服务同目录：安装器下载到 bin/ 的 ggml-large-v3-turbo.bin
 		WhisperModel: filepath.Join(binDir, "ggml-large-v3-turbo.bin"),
 		// cli 兜底同样走同目录
-		WhisperCLI: filepath.Join(binDir, "whisper-cli.exe"),
+		WhisperCLI: filepath.Join(binDir, platformExeName("whisper-cli.exe")),
 		// 远程 API 预填已移除：本地后端优先，无需默认远程 API；需要远程 API 的用户自行填写
 		Language:         "", // 留空=自动检测，支持中英混合；强制中文可填 "zh"
 		Prompt:           "以下是语音转写内容，使用简体中文，英文单词保持原文不要翻译，直接输出。",
@@ -190,7 +131,8 @@ func loadCfg() Config {
 			c.Key = "space"
 		}
 	}
-	// api_key 落盘时为 DPAPI 加密格式（dpapi:<base64>），这里还原为明文供内存使用；
+	// api_key 落盘格式由平台编解码函数处理
+	// （Windows：DPAPI 加密；Linux：恒等透传，只调本地模型）；
 	// 历史明文配置原样兼容。
 	c.APIKey = decodeAPIKeyForLoad(c.APIKey)
 	// 注意：不强制回填 API/Model —— 本地 NPU 后端优先，无需默认远程 API；
@@ -215,7 +157,7 @@ func loadCfg() Config {
 }
 
 func saveCfg(c Config) {
-	// api_key 以 DPAPI 加密后再落盘（encodeAPIKeyForSave 内处理幂等与失败回退）。
+	// api_key 经平台编码后再落盘（encodeAPIKeyForSave 内处理幂等与失败回退）。
 	// c 为值拷贝，不会污染调用方的内存配置。
 	c.APIKey = encodeAPIKeyForSave(c.APIKey)
 	b, _ := json.MarshalIndent(c, "", "  ")
@@ -227,164 +169,26 @@ var cfgPtr atomic.Pointer[Config]
 
 func cfg() *Config { return cfgPtr.Load() }
 
-// ---------- Win32 ----------
-var (
-	user32          = syscall.NewLazyDLL("user32.dll")
-	getAsync        = user32.NewProc("GetAsyncKeyState")
-	sendInput       = user32.NewProc("SendInput")
-	setWinHookEx    = user32.NewProc("SetWindowsHookExW")
-	unhookWinHookEx = user32.NewProc("UnhookWindowsHookEx")
-	callNextHookEx  = user32.NewProc("CallNextHookEx")
-)
-
-// SendInput 常量
-const (
-	inputKeyboard  = 1
-	keyEventFKeyUp = 0x0002
-)
-
-const (
-	whKeyboardLL = 13
-	wmKeyDown    = 0x0100
-	wmKeyUp      = 0x0101
-	wmSysKeyDown = 0x0104
-	wmSysKeyUp   = 0x0105
-)
-
-// hookKeyDown 由键盘钩子回调同步设置，hotkeyLoop 读取（无竞态）
+// ---------- 热键状态（平台热键层与 hotkeyLoop 共享） ----------
+// hookKeyDown 由平台热键层设置（Windows：LL 钩子回调；
+// Linux X11：抓键事件循环；Linux Wayland：socket 脉冲），hotkeyLoop 读取。
 var hookKeyDown atomic.Bool
-var recordingActive atomic.Bool // 录音进行中标记，钩子据此决定是否拦截热键
-var hookVK atomic.Uintptr
-var hookHandle uintptr
+var recordingActive atomic.Bool // 录音进行中标记（Windows 钩子据此决定是否拦截热键）
+var hookVK atomic.Uintptr       // 当前热键码（Windows：VK；Linux：X11 keysym）
 
-type kbdLLHookStruct struct {
-	vkCode   uint32
-	scanCode uint32
-	flags    uint32
-	time     uint32
-	extra    uintptr
-}
+// toggleMode：Wayland 模式为 true，hotkeyLoop 改走 toggle 语义
+// （hookKeyDown 上升沿启停录音，不按住/松开语义）。
+// Windows 与 Linux X11 下保持 false，走原有按住录音逻辑。
+var toggleMode bool
 
-// lowLevelKeyboardProc 低级键盘钩子：录音期间拦截热键防止字符灌入输入框；
-// 非录音时放行，保持按键原有功能可用。同步设置 hookKeyDown 供 hotkeyLoop 读取。
-// 捕获模式下记录任意按键供 captureKey 消费。
-func lowLevelKeyboardProc(nCode int, wParam uintptr, lParam uintptr) uintptr {
-	if nCode >= 0 {
-		kb := (*kbdLLHookStruct)(*(*unsafe.Pointer)(unsafe.Pointer(&lParam)))
-		vk := uintptr(kb.vkCode)
+// 捕获模式下平台捕获层写入的按键信息（captureKey 消费）。
+var capturing atomic.Bool
+var capturedVK atomic.Uint32
+var capturedKeyDown atomic.Bool
 
-		// 捕获模式：记录所有按键事件
-		if capturing.Load() {
-			switch wParam {
-			case wmKeyDown, wmSysKeyDown:
-				capturedVK.Store(uint32(vk))
-				capturedKeyDown.Store(true)
-			case wmKeyUp, wmSysKeyUp:
-				capturedKeyDown.Store(false)
-			}
-		}
-
-		// 正常热键拦截（非捕获模式）
-		if hvk := hookVK.Load(); hvk != 0 && !capturing.Load() && vk == hvk {
-			switch wParam {
-			case wmKeyDown, wmSysKeyDown:
-				hookKeyDown.Store(true)
-				if recordingActive.Load() {
-					return 1 // 录音中：拦截 keydown，防止字符灌入输入框
-				}
-				// 非录音：放行 keydown，保持按键原有功能
-			case wmKeyUp, wmSysKeyUp:
-				hookKeyDown.Store(false)
-				if recordingActive.Load() {
-					return 1 // 录音中：拦截 keyup，保持对称
-				}
-				// 非录音：放行 keyup
-			}
-		}
-	}
-	r, _, _ := callNextHookEx.Call(hookHandle, uintptr(nCode), wParam, lParam)
-	return r
-}
-
-// hookThread 在带消息泵的线程上安装 LL 键盘钩子（LL 钩子要求安装线程有消息循环，且回调始终在该线程执行）
-func hookThread() {
-	runtime.LockOSThread() // 必须：Go 调度器会迁移 goroutine，LL 钩子回调必须在安装线程上执行，否则进程被杀
-	cb := windows.NewCallback(lowLevelKeyboardProc)
-	h, _, err := setWinHookEx.Call(whKeyboardLL, cb, 0, 0)
-	if h == 0 {
-		logf("安装键盘钩子失败: %v", err)
-		return
-	}
-	hookHandle = h
-	logf("键盘钩子已安装 handle=%d", h)
-	// 消息泵
-	var msg struct {
-		HWnd    uintptr
-		Message uint32
-		WParam  uintptr
-		LParam  uintptr
-		Time    uint32
-		Pt      struct{ X, Y int32 }
-	}
-	for {
-		ret, _, _ := procGetMessage.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if int(ret) == -1 {
-			break
-		}
-		// 不需要 Translate/Dispatch，钩子回调由系统直接调用
-	}
-	unhookWinHookEx.Call(hookHandle)
-}
-
-// hookVK 由 main() 在启动时设置，以及用户切换热键时更新
-
-func isDown(vk uintptr) bool {
-	r, _, _ := getAsync.Call(vk)
-	return r&0x8000 != 0
-}
-
-func modVK(m string) uintptr {
-	switch m {
-	case "ctrl":
-		return 0x11
-	case "alt":
-		return 0x12
-	case "shift":
-		return 0x10
-	}
-	return 0
-}
-
-// sendKey 模拟一次按键（SendInput 替代已过时的 keybd_event）
-func sendKey(vk uint16, flags uint32) {
-	type keybdInput struct {
-		wVk         uint16
-		wScan       uint16
-		dwFlags     uint32
-		time        uint32
-		dwExtraInfo uintptr
-	}
-	type input struct {
-		atype uint32
-		ki    keybdInput
-		_     [8]byte // padding 到 32 字节
-	}
-	var inp input
-	inp.atype = inputKeyboard
-	inp.ki.wVk = vk
-	inp.ki.dwFlags = flags
-	sendInput.Call(1, uintptr(unsafe.Pointer(&inp)), unsafe.Sizeof(inp))
-}
-
-func paste() {
-	sendKey(0x11, 0) // ctrl down
-	time.Sleep(20 * time.Millisecond)
-	sendKey(0x56, 0) // v down
-	time.Sleep(20 * time.Millisecond)
-	sendKey(0x56, keyEventFKeyUp) // v up
-	time.Sleep(20 * time.Millisecond)
-	sendKey(0x11, keyEventFKeyUp) // ctrl up
-}
+// 平台热键层入口（见 hook_windows.go / hook_linux.go）：
+// Windows 起 LL 钩子线程；Linux X11 起抓键循环，Wayland 起 socket 监听。
+// setHotkeyCode 更新热键码（Linux X11 下同时通知抓键循环重新抓键）。
 
 // ---------- 状态 ----------
 type Status struct {
@@ -438,6 +242,9 @@ func driveOverlay(t string) {
 		ShowOverlay("转写中", 0x00FF840A, stTrans) // 蓝（呼吸点）
 	case strings.Contains(t, "已粘贴"):
 		ShowOverlay("已粘贴", 0x0059C734, stOK) // 绿
+		scheduleHideLocked()
+	case strings.Contains(t, "已复制到剪贴板"):
+		ShowOverlay("已复制", 0x0059C734, stOK) // 绿：文本已在剪贴板，用户按 Ctrl+V 即可
 		scheduleHideLocked()
 	case strings.Contains(t, "未识别"):
 		ShowOverlay("未识别", 0x000A9FFF, stWarn) // 橙
@@ -608,7 +415,16 @@ func startWhisperServer(c *Config) error {
 		args = append(args, "-l", c.Language)
 	}
 	cmd := exec.Command(c.WhisperServerExe, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.SysProcAttr = hiddenProcAttr()
+	// 子进程输出重定向到日志文件（默认 /dev/null 时 server 崩溃/异常退出
+	// 无任何痕迹，无法定位；日志只追加，不影响转写行为）。
+	if lf, err := os.OpenFile(filepath.Join(os.TempDir(), "whisper-server.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644); err == nil {
+		cmd.Stdout = lf
+		cmd.Stderr = lf
+		defer lf.Close()
+	} else {
+		logf("whisper-server 日志文件打不开（继续用默认输出）: %v", err)
+	}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动 whisper-server 失败: %w", err)
 	}
@@ -683,6 +499,10 @@ var healthClient = &http.Client{Timeout: 2 * time.Second}
 // whisperServerHealthy 调 /health 端点验证 whisper-server 模型已加载、可正常服务。
 // 比 TCP 端口探测可靠：避免“端口先开/模型后载”或僵尸进程占端口时把请求发给半死服务，
 // 拿到空/截断/纯空格结果。该端点不存在(404)时回退 TCP（兼容 lemonade 改版/旧版 server）。
+// 注意：不能只认 /health 200——llama-server 的 /health 同样回 200 + {"status":"ok"}，
+// 且它默认占 8080。必须再看 Server 头：whisper.cpp 发 "Server: whisper.cpp"，
+// llama.cpp 发 "Server: llama.cpp"。Server 头存在但不含 whisper 时直接判否；
+// Server 头缺失时沿用旧行为（200 即健康），避免未来 whisper 版本改头导致复用失效。
 func whisperServerHealthy(c *Config) bool {
 	port := c.WhisperServerPort
 	if port == 0 {
@@ -696,6 +516,10 @@ func whisperServerHealthy(c *Config) bool {
 	defer resp.Body.Close()
 	io.Copy(io.Discard, resp.Body)
 	if resp.StatusCode == 200 {
+		if srv := resp.Header.Get("Server"); srv != "" && !strings.Contains(strings.ToLower(srv), "whisper") {
+			logf("whisperServerHealthy: 端口 %d 的 /health 200 但 Server 头为 %q，非 whisper-server，不复用", port, srv)
+			return false
+		}
 		return true
 	}
 	if resp.StatusCode == 404 {
@@ -705,39 +529,10 @@ func whisperServerHealthy(c *Config) bool {
 	return false
 }
 
-// killStaleWhisperServer 清理残留的 whisper-server.exe。
-// 场景：父进程 voice2text 被 taskkill 强杀时，defer 不执行，whisper-server 成孤儿继续占端口，
+// killStaleWhisperServer 清理残留 whisper-server（见 kill_windows.go / kill_linux.go）。
+// 场景：父进程被强杀时 defer 不执行，whisper-server 成孤儿继续占端口，
 // 下次启动若盲目复用会拿到异常结果（空格/乱码/截断）。
-// 优先用 PID 精确杀，无 PID 时退化为按镜像名杀。
-func killStaleWhisperServer() {
-	wsMu.Lock()
-	pid := 0
-	if wsProc != nil && wsProc.Process != nil {
-		pid = wsProc.Process.Pid
-	}
-	wsMu.Unlock()
-	if pid != 0 {
-		// 精确杀：只杀本实例启动的进程
-		cmd := exec.Command("taskkill", "/F", "/PID", fmt.Sprintf("%d", pid))
-		cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-		if err := cmd.Run(); err == nil {
-			logf("已清理残留 whisper-server pid=%d", pid)
-			wsMu.Lock()
-			wsProc = nil
-			wsMu.Unlock()
-			return
-		}
-	}
-	// 退化：PID 不可用（孤儿来自被强杀的旧实例），按镜像名清理。
-	// 警告：这会杀掉本机所有 whisper-server.exe（含其他用户会话/其他实例），
-	// 仅在 PID 路径不可用时作为最后兜底。
-	logf("警告: 按镜像名 taskkill whisper-server.exe，可能影响本机其他实例/用户会话的同名进程")
-	cmd := exec.Command("taskkill", "/F", "/IM", "whisper-server.exe")
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	if err := cmd.Run(); err == nil {
-		logf("已清理残留 whisper-server（按镜像名）")
-	}
-}
+// 优先用 PID 精确杀，无 PID 时退化为按名杀。
 
 func orDefault(s, def string) string {
 	if s == "" {
@@ -1008,24 +803,21 @@ func doTranscribe(pcm []byte, status *Status) {
 		status.set("未识别到内容")
 		return
 	}
-	// 串行化"写剪贴板+模拟粘贴"整个序列：并发转写时两个 goroutine 的
-	// WriteAll/paste 若交错，A 的粘贴会贴出 B 的文本。
+	// 串行化文本输出整个序列：并发转写时两个 goroutine 的
+	// 输出若交错，A 的粘贴会贴出 B 的文本。
+	// emitText 是平台函数：Windows 走剪贴板 + Ctrl+V；
+	// Linux Wayland 走 wtype 打字（GNOME 下 wtype 不可用时降级为仅剪贴板，
+	// 返回 errClipboardOnly），X11 走剪贴板 + xdotool。
 	pasteMu.Lock()
 	defer pasteMu.Unlock()
-	var clipErr error
-	for retry := 0; retry < 3; retry++ {
-		clipErr = clipboard.WriteAll(text)
-		if clipErr == nil {
-			break
+	if err := emitText(text); err != nil {
+		if errors.Is(err, errClipboardOnly) {
+			status.set("已复制到剪贴板，请按 Ctrl+V 粘贴")
+			return
 		}
-		time.Sleep(30 * time.Millisecond)
-	}
-	if clipErr != nil {
-		status.set(fmt.Sprintf("写入剪贴板失败: %v", clipErr))
+		status.set(fmt.Sprintf("输出失败: %v", err))
 		return
 	}
-	time.Sleep(30 * time.Millisecond)
-	paste()
 	// 不再每次转写后重启 whisper-server：
 	// condition_on_previous_text=false 已防止上下文污染，重启会导致下次请求等待模型重载（10-30s）
 	// 仅在检测到异常结果时才需要重启（由 suspiciousResult 触发错误路径）
@@ -1035,6 +827,12 @@ func doTranscribe(pcm []byte, status *Status) {
 
 // pasteMu 串行化剪贴板写+粘贴序列，见 doTranscribe。
 var pasteMu sync.Mutex
+
+// errClipboardOnly：文本已写进剪贴板，但自动打字不可用
+// （Linux Wayland 下 wtype 失败时的降级结果，不是错误；
+// 由 paste_linux.go 返回，doTranscribe 据此提示手动 Ctrl+V）。
+// 放共享代码里：doTranscribe（共享）要引用它，平台文件按需返回。
+var errClipboardOnly = errors.New("clipboard-only")
 
 // ---------- 日志（持久化文件句柄，避免每次 OpenFile+Close） ----------
 var logFile *os.File
@@ -1079,7 +877,7 @@ func watchConfig() {
 			prev := cfg()
 			c := loadCfg()
 			cfgPtr.Store(&c)
-			hookVK.Store(vkForName(c.Key)) // 配置热重载时同步更新钩子
+			setHotkeyCode(vkForName(c.Key)) // 配置热重载时同步更新热键
 			logf("配置已热重载: key=%s mod=%s api=%s model=%s lang=%s api_key=%s",
 				c.Key, c.Mod, c.API, c.Model, c.Language, boolStr(c.APIKey != ""))
 			// 后端相关配置变更 → 后台重启 whisper-server，让新配置生效
@@ -1104,95 +902,12 @@ func boolStr(b bool) string {
 	return "无"
 }
 
-// mutex 句柄（持有到进程退出，防止重复启动）
-var mutexHandle windows.Handle
-
-func acquireMutex() bool {
-	h, err := windows.CreateMutex(nil, true, windows.StringToUTF16Ptr("Global\\voice2text-single-instance"))
-	// ERROR_ALREADY_EXISTS 必须先于通用 err 检查，否则 handle 泄漏
-	if err == windows.ERROR_ALREADY_EXISTS {
-		_ = windows.CloseHandle(h)
-		return false
-	}
-	if err != nil {
-		return false
-	}
-	mutexHandle = h
-	return true
-}
-
-// ---------- 自定义快捷键捕获 ----------
-var capturing atomic.Bool
-
-// 捕获模式下钩子回调写入的按键信息
-var capturedVK atomic.Uint32
-var capturedKeyDown atomic.Bool
-
-// captureKey 进入捕获模式：3 秒内按下任意键（松开即生效，Esc 取消）
-// 通过键盘钩子回调直接检测，不依赖 GetAsyncKeyState
-func captureKey() {
-	capturing.Store(true)
-	capturedVK.Store(0)
-	capturedKeyDown.Store(false)
-	updateTrayStatus("状态：请按下新热键（3秒内，Esc取消）")
-	logf("进入自定义快捷键捕获")
-
-	deadline := time.Now().Add(3 * time.Second)
-	gotKeyDown := false
-	var pressedVK uintptr
-
-	for time.Now().Before(deadline) {
-		if capturedKeyDown.Load() {
-			vk := uintptr(capturedVK.Load())
-			if !gotKeyDown {
-				gotKeyDown = true
-				pressedVK = vk
-				logf("捕获: keydown vk=0x%X", vk)
-			}
-		} else if gotKeyDown {
-			// 松开了
-			capturing.Store(false)
-			if pressedVK == 0x1B { // Esc 取消
-				updateTrayStatus("状态：已取消")
-				logf("取消自定义快捷键")
-				return
-			}
-			// 修饰键无法作为独立热键（释放即停止录音，且与打字冲突），跳过并继续等待下一个键
-			switch pressedVK {
-			case 0x10, 0x11, 0x12, 0x14, 0x90, 0x91,
-				0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C:
-				gotKeyDown = false
-				capturedVK.Store(0)
-				logf("捕获: 修饰键 0x%X 跳过，继续等待", pressedVK)
-				capturing.Store(true) // 恢复捕获模式
-				continue
-			}
-			name := vkToName(pressedVK)
-			if name == "" {
-				updateTrayStatus("状态：不支持的按键 vk=0x" + fmt.Sprintf("%X", pressedVK))
-				logf("捕获: 不支持的按键 vk=0x%X", pressedVK)
-				return
-			}
-			c := *cfg()
-			c.Key = name
-			c.Mod = ""
-			saveCfg(c)
-			nc := c
-			cfgPtr.Store(&nc)
-			hookVK.Store(vkForName(name)) // 同步更新钩子拦截的 VK
-			updateTrayStatus("状态：快捷键已设为 " + name)
-			logf("自定义快捷键设为 %s (vk=0x%X)", name, pressedVK)
-			return
-		}
-		time.Sleep(15 * time.Millisecond)
-	}
-	capturing.Store(false)
-	updateTrayStatus("状态：超时未捕获")
-	logf("自定义快捷键超时未捕获")
-}
+// 单实例锁见 mutex_windows.go / mutex_linux.go。
+// 自定义快捷键捕获见 capture_windows.go / capture_linux.go。
 
 // ---------- 热键轮询 ----------
-// hookKeyDown 由键盘钩子回调同步设置（无竞态），hotkeyLoop 只需轮询读取。
+// hookKeyDown 由平台热键层设置（无竞态），hotkeyLoop 只需轮询读取。
+// toggleMode（Linux Wayland）下走 toggle 语义：上升沿启停录音。
 func hotkeyLoop(status *Status) {
 	pressed := false
 	var pressedAt time.Time
@@ -1200,14 +915,67 @@ func hotkeyLoop(status *Status) {
 	recording := false
 	recWarned := false // 本次录音是否已提示"超长"
 
+	// toggleStop 停止当前录音并按常规规则处理（过短/静音/转写），
+	// 供 toggleMode 分支与硬上限分支共用。
+	toggleStop := func() {
+		recording = false
+		recordingActive.Store(false) // 通知钩子：录音已结束，放行热键
+		SetActiveRecorder(nil)       // 停止读波形
+		SetOverLimit(false)
+		recWarned = false
+		pcm, err := rec.Stop()
+		rec = &Recorder{}
+		if err != nil {
+			status.set(fmt.Sprintf("停止录音失败: %v", err))
+		} else if len(pcm) < SR*3/10 { // <0.3s 忽略
+			status.set("录音过短，忽略")
+		} else if IsSilent(pcm) {
+			// 录音时长够但能量极低 = 麦克风被静音或未输入，明确提示而非转写静音
+			status.set("未录到声音")
+		} else {
+			go doTranscribe(pcm, status)
+		}
+	}
+
 	for {
 		if capturing.Load() { // 捕获模式暂停热键
 			time.Sleep(25 * time.Millisecond)
 			continue
 		}
 		c := cfg()
+
+		// toggle 模式：hookKeyDown 上升沿切换录音启停（Wayland socket 脉冲驱动）。
+		// 注意：toggle 下忽略 HoldMs 与 Mod——组合键由 GNOME 快捷键本身定义。
+		if toggleMode {
+			hit := hookKeyDown.Load()
+			if hit && !pressed {
+				pressed = true
+				if recording {
+					toggleStop()
+				} else {
+					recording = true
+					recordingActive.Store(true)
+					if err := rec.Start(); err != nil {
+						status.set(fmt.Sprintf("录音失败: %v", err))
+						recording = false
+						recordingActive.Store(false)
+					} else {
+						SetActiveRecorder(rec)
+						SetOverLimit(false)
+						recWarned = false
+						status.set("录音中")
+					}
+				}
+			} else if !hit {
+				pressed = false
+			}
+			updateStatusItem(status)
+			time.Sleep(25 * time.Millisecond)
+			continue
+		}
+
 		mv := modVK(c.Mod)
-		// hookKeyDown 由钩子回调同步设置，modifier 通过 GetAsyncKeyState 检测
+		// hookKeyDown 由平台热键层设置，modifier 由平台 isDown 检测
 		hit := hookKeyDown.Load() && (mv == 0 || isDown(mv))
 
 		// 录音中：时长保护（软警告变橙 + 硬上限自动停止）
@@ -1304,7 +1072,7 @@ func startTray() {
 			saveCfg(c)
 			nc := c
 			cfgPtr.Store(&nc)
-			hookVK.Store(vkForName(k)) // 同步更新钩子拦截的 VK
+			setHotkeyCode(vkForName(k)) // 同步更新热键
 			updateTrayStatus("状态：快捷键已切换为 " + k)
 			logf("热键切换为 %s", k)
 		},
@@ -1312,7 +1080,7 @@ func startTray() {
 			go captureKey()
 		},
 		onAPI: func() {
-			_ = exec.Command("notepad.exe", cfgPath()).Start()
+			openConfig()
 		},
 		onQuit: func() {
 			logf("收到退出请求")
@@ -1381,13 +1149,18 @@ func main() {
 		}
 		return
 	}
+	// toggle 子命令（Linux Wayland 模式）：经 socket 通知主进程启停录音。
+	// Windows 版不支持，toggleCommandMain 会打印提示并以 1 退出。
+	if len(os.Args) > 1 && os.Args[1] == "toggle" {
+		os.Exit(toggleCommandMain())
+	}
 	// 单实例锁：防止多个实例抢占热键 / 残留幽灵图标
 	if !acquireMutex() {
 		os.Exit(0)
 	}
 	c := loadCfg()
 	cfgPtr.Store(&c)
-	hookVK.Store(vkForName(c.Key)) // 钩子始终拦截此 VK
+	setHotkeyCode(vkForName(c.Key)) // 热键层始终拦截此按键
 	logf("启动：热键=%s mod=%s hold=%dms api=%s", c.Key, c.Mod, c.HoldMs, c.API)
 
 	// 自动选后端（安装器写入 auto_backend 时生效）：按 NPU>GPU>CPU 回退。
@@ -1425,32 +1198,20 @@ func main() {
 	status.set("空闲")
 	go hotkeyLoop(status)
 	go watchConfig()
-	go configHotkeyLoop() // 兜底：Ctrl+Shift+C 打开配置（托盘菜单失效时也能用）
-	go hookThread()       // 低级键盘钩子线程（录音期间拦截热键字符）
-	initOverlay()         // 悬浮窗（录音/转写状态可视）
-	logf("准备进入自实现托盘循环")
+	go configHotkeyLoop() // 兜底：Ctrl+Shift+Alt+C 打开配置（托盘菜单失效时也能用；Linux Wayland 下无此兜底）
+	go startHotkeyLayer() // 平台热键层（Windows：LL 钩子；Linux X11：抓键；Wayland：socket）
+	initOverlay()         // 悬浮窗（录音/转写状态可视；Linux 版映射为托盘 + 通知）
+	logf("准备进入托盘循环")
 	startTray()
 	// 主协程阻塞，保持进程存活（托盘消息循环在 goroutine 中运行）
 	<-quitCh
 }
 
-// configHotkeyLoop 全局配置热键：Ctrl+Shift+Alt+C 打开配置文件（托盘菜单不可用时的兜底）。
-// 用较冷门的四键组合，避免与各种应用的单 Ctrl+Shift+C 冲突。
-func configHotkeyLoop() {
-	const vkC = 0x43 // C
-	const vkCtrl = 0x11
-	const vkShift = 0x10
-	const vkAlt = 0x12
-	for {
-		ctrl := isDown(vkCtrl)
-		shift := isDown(vkShift)
-		alt := isDown(vkAlt)
-		c := isDown(vkC)
-		if ctrl && shift && alt && c {
-			logf("配置热键 Ctrl+Shift+Alt+C 触发，打开配置")
-			_ = exec.Command("notepad.exe", cfgPath()).Start()
-			time.Sleep(500 * time.Millisecond) // 防重复触发
-		}
-		time.Sleep(50 * time.Millisecond)
+// currentKeyName 返回当前配置的热键名（托盘菜单高亮用，平台共享）。
+func currentKeyName() string {
+	c := cfg()
+	if c == nil {
+		return "space"
 	}
+	return c.Key
 }
