@@ -145,7 +145,7 @@ if os.path.exists(cfg_path):
         print(f"[安装] 旧配置解析失败，已备份后重建：{e}")
         os.replace(cfg_path, cfg_path + ".bak")
         cfg = {}
-cfg.setdefault("key", "space")
+cfg.setdefault("key", "f8")
 cfg.setdefault("mod", "")
 cfg.setdefault("hold_ms", 300)
 cfg["whisper_server_exe"] = server_exe

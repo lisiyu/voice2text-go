@@ -92,7 +92,7 @@ func defaultCfg() Config {
 		}
 	}
 
-	return Config{Key: "space", Mod: "", HoldMs: 300,
+	return Config{Key: "f8", Mod: "", HoldMs: 300,
 		WhisperServerExe:  serverExe,
 		WhisperServerURL:  fmt.Sprintf("http://127.0.0.1:%d/inference", defaultWhisperPort),
 		WhisperServerPort: defaultWhisperPort,
@@ -128,7 +128,7 @@ func loadCfg() Config {
 	}
 	if _, ok := vkMap[c.Key]; !ok {
 		if vkForName(c.Key) == 0 {
-			c.Key = "space"
+			c.Key = "f8"
 		}
 	}
 	// api_key 落盘格式由平台编解码函数处理
@@ -1211,7 +1211,7 @@ func main() {
 func currentKeyName() string {
 	c := cfg()
 	if c == nil {
-		return "space"
+		return "f8"
 	}
 	return c.Key
 }

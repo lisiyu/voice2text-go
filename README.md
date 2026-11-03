@@ -77,7 +77,7 @@ go build -ldflags="-H windowsgui" -o voice2text.exe .
 - **用法（Wayland）**：按 Ctrl+Alt+V 开始，再按一次停止并转写（toggle 语义）；
   转写后文本进剪贴板，托盘状态与通知提示“已复制到剪贴板，请按 Ctrl+V 粘贴”，
   在目标输入框按 Ctrl+V 粘贴。`voice2text toggle` 子命令亦可直接触发。
-- **用法（X11）**：全局热键（默认 space）+ 自动 Ctrl+V 粘贴；
+- **用法（X11）**：全局热键（默认 f8）+ 自动 Ctrl+V 粘贴；
   **X11 路径未在真机验证**（真机为 Wayland）。
 - **托盘**：需 AppIndicator 扩展；Wayland 下新启用的扩展需注销重登录后才载入。
 - **已知限制**：GNOME 下 `wtype` 不能打字（Mutter 不实现 virtual-keyboard 协议），
@@ -93,7 +93,7 @@ go build -ldflags="-H windowsgui" -o voice2text.exe .
 
 ```json
 {
-  "key": "space",
+  "key": "f8",
   "mod": "",
   "hold_ms": 300,
   "whisper_server_exe": "C:\\path\\to\\whisper-server.exe",
@@ -123,7 +123,7 @@ go build -ldflags="-H windowsgui" -o voice2text.exe .
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `key` | string | `space` | 触发录音的快捷键 |
+| `key` | string | `f8` | 触发录音的快捷键 |
 | `mod` | string | `""` | 修饰键（ctrl/alt/shift） |
 | `hold_ms` | int | `300` | 长按触发时间（毫秒） |
 | `whisper_server_exe` | string | - | whisper-server 可执行文件路径 |

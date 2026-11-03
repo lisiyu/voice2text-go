@@ -97,7 +97,7 @@ go build -ldflags="-H windowsgui" -o voice2text.exe .
 
 ### 用法（X11）
 
-X11 会话下用全局热键（默认 space，长按录音、松开转写，与 Windows 一致），
+X11 会话下用全局热键（默认 f8，长按录音、松开转写，与 Windows 一致），
 转写后自动发 Ctrl+V 粘贴。**注意：X11 路径未在真机验证**（真机为 Wayland），
 X11 用户请按同样流程验收一次。
 
