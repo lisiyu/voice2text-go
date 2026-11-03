@@ -4,9 +4,15 @@ package main
 
 // hook_linux.go - Linux 热键层入口。
 //   X11：XGrabKey 抓键（纯 Go xgb），事件循环驱动 hookKeyDown；
-//   Wayland：普通应用拿不到全局热键，改走 Unix socket 触发
+//   Wayland：优先 evdev 按住模式（被动读 /dev/input/event*，见 evdev_linux.go），
+//     读不到设备或无权限时回落 Unix socket 触发
 //     （voice2text toggle），并把 hotkeyLoop 切到 toggle 语义
 //     （按一下开始、再按一下停止，见 main.go 的 toggleMode 分支）。
+//     注意：evdev 接管成功时不启动 socket——两路同时驱动 hookKeyDown
+//     会互相打架（socket 的 150ms 脉冲会提前打断按住录音）；
+//     此时 GNOME 快捷键绑定（Ctrl+Alt+V → voice2text toggle）
+//     因无 socket 监听而失效，属预期行为，install.sh 仍保留该绑定
+//     以备 evdev 失败时回落使用。
 import (
 	"github.com/jezek/xgb"
 	"github.com/jezek/xgb/xproto"
@@ -30,9 +36,13 @@ func startHotkeyLayer() {
 	ensureSessionEnv()
 	switch linuxSessionType() {
 	case "wayland":
-		toggleMode = true
-		go socketListener()
-		logf("热键层：Wayland 模式，全局热键不可用，走 socket 触发（voice2text toggle）")
+		if startEvdevHotkey() {
+			logf("热键层：Wayland 模式，evdev 按住模式已启动（GNOME 快捷键 toggle 停用）")
+		} else {
+			toggleMode = true
+			go socketListener()
+			logf("热键层：Wayland 模式，evdev 不可用，走 socket 触发（voice2text toggle）")
+		}
 	case "x11":
 		go xGrabLoop()
 		logf("热键层：X11 模式，XGrabKey 抓键")

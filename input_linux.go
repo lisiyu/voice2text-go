@@ -3,8 +3,9 @@
 package main
 
 // input_linux.go - 按键状态查询与修饰键映射。
-// isDown 查 X11 QueryKeymap（Wayland 下无全局按键状态查询，
-// 返回 false；toggle 模式不依赖它，见 hotkeyLoop）。
+// isDown 查 X11 QueryKeymap（Wayland 下无全局按键状态查询）；
+// Wayland + evdev 模式下改查 evdev 聚合 goroutine 维护的修饰键状态，
+// toggle 模式不依赖它，见 hotkeyLoop。
 import (
 	"sync"
 
@@ -20,6 +21,11 @@ var (
 // isDown 判断某 keysym 对应的物理键当前是否按下（X11 QueryKeymap）。
 func isDown(vk uintptr) bool {
 	if linuxSessionType() == "wayland" {
+		// evdev 模式：修饰键状态由 evdev 聚合 goroutine 维护；
+		// 非 evdev（toggle）模式下无状态可查，返回 false。
+		if evdevActive.Load() {
+			return evdevIsModDown(vk)
+		}
 		return false
 	}
 	isDownMu.Lock()

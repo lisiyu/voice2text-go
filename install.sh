@@ -79,6 +79,30 @@ if [ -n "$need_tools" ]; then
     info "wtype / wl-copy 已就绪"
 fi
 
+# ---------- 3b. ydotool + input 组（Wayland 自动粘贴与 evdev 按住热键的前提） ----------
+# 注意：本节只检测、不安装、不 sudo——ydotoold 需以系统服务运行、
+# 用户需加入 input 组，都必须用户在自己的终端里手动执行；
+# 缺失时程序自动回落（剪贴板+手动 Ctrl+V、socket toggle），不影响安装。
+ydotool_todo=""
+command -v ydotool >/dev/null 2>&1 || ydotool_todo="$ydotool_todo 装 ydotool"
+if ! systemctl is-active --quiet ydotoold 2>/dev/null; then
+    ydotool_todo="$ydotool_todo 起 ydotoold 服务"
+fi
+if ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx "input"; then
+    ydotool_todo="$ydotool_todo 入 input 组"
+fi
+if [ -n "$ydotool_todo" ]; then
+    info "ydotool 相关未就绪（缺：$ydotool_todo），请在自己的终端里手动执行（本脚本不自动 sudo）："
+    echo "  sudo apt-get install -y ydotool"
+    echo "  sudo systemctl enable --now ydotoold"
+    echo "  sudo usermod -aG input \$USER"
+    echo "  # 然后注销重登录（input 组与托盘扩展同时生效）"
+    echo "  # 验证：ydotool key ctrl+v（光标处应粘出剪贴板内容）"
+    info "未就绪时不影响安装：自动粘贴回落为剪贴板+手动 Ctrl+V，按住热键回落为 socket toggle"
+else
+    info "ydotool / ydotoold / input 组已就绪"
+fi
+
 # ---------- 4. 文件落位 ----------
 mkdir -p "$BIN_DIR"
 [ -f "$PKG_DIR/voice2text" ] || fail "交付包里没有 voice2text 主程序（应在脚本同目录）"

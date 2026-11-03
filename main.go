@@ -806,8 +806,8 @@ func doTranscribe(pcm []byte, status *Status) {
 	// 串行化文本输出整个序列：并发转写时两个 goroutine 的
 	// 输出若交错，A 的粘贴会贴出 B 的文本。
 	// emitText 是平台函数：Windows 走剪贴板 + Ctrl+V；
-	// Linux Wayland 走 wtype 打字（GNOME 下 wtype 不可用时降级为仅剪贴板，
-	// 返回 errClipboardOnly），X11 走剪贴板 + xdotool。
+	// Linux Wayland 走剪贴板 + ydotool Ctrl+V（不可用时试 wtype，
+	// 都失败降级为仅剪贴板，返回 errClipboardOnly），X11 走剪贴板 + xdotool。
 	pasteMu.Lock()
 	defer pasteMu.Unlock()
 	if err := emitText(text); err != nil {
